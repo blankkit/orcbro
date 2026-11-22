@@ -48,7 +48,9 @@ spools report their amount through their chip (with "Estimate Remaining" on in t
 write an NFC tag once (filament, color, spool size) and read it when you load the spool: the bridge then subtracts
 what each print uses, also for prints from OrcaSlicer or Bambu Studio, and Bambro writes the current amount back to
 the tag whenever you read it. To add a spool before it goes into the AMS, use Add Spool in the library: it reads the
-tag, or writes a blank one. Deleted a spool by mistake? Read its tag again and choose Restore. The demo printer
+tag, or writes a blank one. To change a spool, open it in the library and tap Edit Spool: Bambro reads its tag first
+and writes the changes to the tag and to the library. Change the amount left only after weighing the spool: it
+replaces what the bridge counted. Deleted a spool by mistake? Read its tag again and choose Restore. The demo printer
 shows sample spools in the library.
 
 **Why does a new spool show Generic PLA in gray?** When a spool without a Bambu chip goes into an AMS slot, the printer

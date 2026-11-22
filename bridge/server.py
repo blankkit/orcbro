@@ -41,7 +41,7 @@ from .identity import BridgeIdentity, load_identity
 from .models import DUAL_NOZZLE_MODELS, LEGACY_MODELS, Models
 from .probe import ProbeError, probe, read_identity
 from .live import ENVIRONMENTS, SHARED_DEVICE, LiveActivities, Registry, public_printer_id
-from .spools import TAG_FIELDS, BambuAmount, Plan, SpoolStore, SpoolTracker, trays_of
+from .spools import TAG_FIELDS, BambuAmount, BambuFilament, CountedAmount, Plan, SpoolStore, SpoolTracker, trays_of
 from .notify import EVENTS as NOTIFY_EVENTS
 from .mdns import MDNSAdvertiser
 from .newspool import NewSpoolWatcher
@@ -2273,21 +2273,33 @@ async def list_spools(request: web.Request) -> web.Response:
 
 
 async def update_spool(request: web.Request) -> web.Response:
-    """`{"remaining": grams, "note": text, "unload": true}`; Bambu spools take only a note and unloading."""
-    try:
-        body = await request.json()
-    except ValueError:
-        return error(400, m('Invalid JSON.'))
-    if not isinstance(body, dict):
-        return error(400, m('Invalid JSON.'))
-    note, unload = body.get("note"), body.get("unload", False)
-    if not (note is None or isinstance(note, str)) or not isinstance(unload, bool):
+    """`{"note": text, "unload": true, "type", "brand", "subtype", "color", "nozzle_temp_min", "nozzle_temp_max",
+    "weight", "remaining": grams, "override_remaining": true}`, all optional.
+
+    Tag fields and `weight` (full spool) follow a rewritten tag of a tagged spool: a field sent as null or "" is
+    cleared, one left out stays. `remaining` replaces the counted amount and needs `override_remaining: true`, so an
+    edit never resets the counting by accident; `remaining` sent alone (older apps) counts as an override. Bambu spools take only a note and unloading. Nothing changes when
+    any field is invalid."""
+    body = await _spool_body(request)
+    if isinstance(body, web.Response):
+        return body
+    note, unload, override = body.get("note"), body.get("unload", False), body.get("override_remaining", False)
+    if not (note is None or isinstance(note, str)) or not isinstance(unload, bool) or not isinstance(override, bool):
         return error(422, m('Invalid spool data (tag ID or amount).'))
+    # Bambro before 0.9.45 corrects the amount with `remaining` alone ("Adjust Amount"): still an explicit override.
+    if "override_remaining" not in body and "remaining" in body and not any(key in body for key in (*TAG_FIELDS, "weight")):
+        override = True
     try:
         spool = request.app[SPOOLS].update(request.match_info["spool_id"], remaining=body.get("remaining"),
-                                           note=note, unload=unload)
+                                           override_remaining=override, note=note, unload=unload,
+                                           info={key: body[key] for key in TAG_FIELDS if key in body},
+                                           weight=body.get("weight"))
     except BambuAmount:
         return error(422, m('The AMS reports the amount of Bambu spools; it cannot be changed here.'))
+    except BambuFilament:
+        return error(422, m('The AMS reports the filament of Bambu spools; it cannot be changed here.'))
+    except CountedAmount:
+        return error(422, m('A new remaining amount replaces the amount the bridge counted; send override_remaining: true with it.'))
     except (TypeError, ValueError):
         return error(422, m('Invalid spool data (tag ID or amount).'))
     if spool is None:

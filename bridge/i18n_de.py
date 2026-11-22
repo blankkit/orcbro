@@ -502,6 +502,8 @@ DE = {
     "Invalid spool request.": "Ungültige Spulenanfrage.",
     "Invalid spool data (tag ID or amount).": "Ungültige Spulendaten (Sticker-ID oder Menge).",
     "The AMS reports the amount of Bambu spools; it cannot be changed here.": "Die Menge von Bambu-Spulen meldet das AMS; sie lässt sich hier nicht ändern.",
+    "The AMS reports the filament of Bambu spools; it cannot be changed here.": "Das Filament von Bambu-Spulen meldet das AMS; es lässt sich hier nicht ändern.",
+    "A new remaining amount replaces the amount the bridge counted; send override_remaining: true with it.": "Eine neue Restmenge ersetzt die von der Bridge gezählte Menge; dafür override_remaining: true mitsenden.",
     "Spool not found.": "Spule nicht gefunden.",
     "New spool in slot %s: no Generic profile (%s)": "Neue Spule in Fach %s: kein Generic-Profil (%s)",
     "New spool in slot %s: left as it is (%s)": "Neue Spule in Fach %s: bleibt, wie sie ist (%s)",

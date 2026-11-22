@@ -5,7 +5,8 @@ percentage, so the bridge only records what it sees. Third-party tags are invisi
 when a spool is loaded and tells the bridge which spool (tag UID) sits in which slot, and the bridge keeps the books.
 Spools can also be added in the library without a slot; they are placed when their tag is read for a slot. After
 every print it subtracts what the print used from each slot's spool; the app writes the current amount back to
-the tag whenever the phone touches it again.
+the tag whenever the phone touches it again. A tagged spool can be edited after its tag was rewritten (`update`):
+filament, color and full weight; the counted amount changes only when the app overrides it explicitly.
 
 Usage per slot comes from the sliced file (grams per filament on the printed plate):
 - prints sent by the bridge know their filament → slot mapping;
@@ -54,6 +55,14 @@ SPOOL_NUMBERS = ("weight", "remaining", "remaining_percent", "used", "nozzle_tem
 
 class BambuAmount(ValueError):
     """The AMS reports the amount of Bambu spools; it cannot be set."""
+
+
+class BambuFilament(ValueError):
+    """The AMS reports the filament and size of Bambu spools; they cannot be edited."""
+
+
+class CountedAmount(ValueError):
+    """A new remaining amount replaces the one the bridge counted, so it needs `override_remaining`."""
 
 
 def trays_of(status: dict) -> list[dict]:
@@ -182,6 +191,22 @@ def tag_info(info: dict | None) -> dict:
         elif not _is_number(value) or not 0 <= value <= MAX_TEMPERATURE:
             raise ValueError(key)
         out[key] = value
+    return out
+
+
+def tag_changes(fields: dict) -> dict:
+    """Edited tag fields (`TAG_FIELDS` only), validated like `tag_info`. `None` or "" clears a field; a tag always has
+    a material and a color, so those cannot be cleared. Raises ValueError."""
+    out = {}
+    for key, value in fields.items():
+        if key not in TAG_FIELDS:
+            continue
+        if value in (None, ""):
+            if key in ("type", "color"):
+                raise ValueError(key)
+            out[key] = None
+        else:
+            out.update(tag_info({key: value}))
     return out
 
 
@@ -397,20 +422,44 @@ class SpoolStore:
             self.save()
         return len(spools)
 
-    def update(self, spool_id: str, *, remaining: float | None = None, note: str | None = None,
-               unload: bool = False) -> dict | None:
+    def update(self, spool_id: str, *, remaining: float | None = None, override_remaining: bool = False,
+               note: str | None = None, unload: bool = False, info: dict | None = None,
+               weight: float | None = None) -> dict | None:
+        """Change a spool in the library. Tagged spools only: `info` (tag fields, see `tag_changes`) and `weight`
+        (full spool) after the tag was rewritten, and `remaining` with `override_remaining`, which replaces the
+        counted amount (for a weighed spool). A plain edit keeps the counted amount; a smaller full weight caps it.
+        The spool stays the same spool: its slot and its statistics (prints, used grams, last used) stay. Returns
+        None for an unknown spool; raises ValueError (`BambuAmount`, `BambuFilament`, `CountedAmount`) before
+        changing anything."""
         spool = self.get(spool_id)
         if spool is None:
             return None
         # Validate everything before changing anything.
+        changes = tag_changes(info or {})
         if remaining is not None:
             if spool["kind"] == "bambu":
                 raise BambuAmount("bambu")
             remaining = _grams(remaining)
+            if not override_remaining:
+                raise CountedAmount("remaining")
+        elif override_remaining:
+            raise ValueError("remaining")
+        if weight is not None:
+            weight = _grams(weight)
+            if not weight:
+                raise ValueError("weight")
+        if spool["kind"] == "bambu" and (changes or weight is not None):
+            raise BambuFilament("bambu")
         if note is not None and not isinstance(note, str):
             raise ValueError("note")
+        spool.update(changes)
+        if weight is not None:
+            spool["weight"] = weight
         if remaining is not None:
             spool["remaining"] = remaining
+        full, left = spool.get("weight"), spool.get("remaining")
+        if (changes or weight is not None or remaining is not None) and full and left is not None and left > full:
+            spool["remaining"] = full
         if note is not None:
             spool["note"] = note.strip()[:200] or None
         if unload:
@@ -460,7 +509,9 @@ class SpoolStore:
                 "nozzle_temp_min": spool.get("nozzle_temp_min"), "nozzle_temp_max": spool.get("nozzle_temp_max"),
                 "printer": spool.get("printer"), "slot": spool.get("slot"), "created": spool.get("created"),
                 "updated": spool.get("updated"), "last_used": spool.get("last_used"), "prints": spool.get("prints") or 0,
-                "used": spool.get("used") or 0.0, "note": spool.get("note")}
+                "used": spool.get("used") or 0.0, "note": spool.get("note"),
+                # `PATCH /api/spools/{id}` takes tag fields and the full weight (tagged spools).
+                "editable": spool["kind"] == "tag"}
 
 
 Plan = tuple[list[dict], dict[int, int] | None]

@@ -166,12 +166,82 @@ class StoreTests(unittest.TestCase):
         self.store.load("P1", 0, UID, weight=250)
         self.store.consume("P1", {0: 400})
         self.assertEqual(self.store.at("P1", 0)["remaining"], 0.0)
-        spool = self.store.update(UID, remaining=180, note=" Rest  ", unload=True)
+        spool = self.store.update(UID, remaining=180, override_remaining=True, note=" Rest  ", unload=True)
         self.assertEqual((spool["remaining"], spool["note"], spool["slot"]), (180.0, "Rest", None))
         self.store.delete(UID)
         self.store.spools[UID]["deleted"] = time.time() - 200 * 86400
         self.store.save()
         self.assertNotIn(UID, SpoolStore(self.store.path).spools)
+
+
+class EditTests(unittest.TestCase):
+    """Editing a tagged spool after its tag was rewritten (`PATCH /api/spools/{id}`)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = SpoolStore(Path(self.tmp.name) / "spools.json")
+        self.store.load("P1", 0, UID, weight=1000, info={**PLA_WHITE, "nozzle_temp_min": 190, "nozzle_temp_max": 230})
+        self.store.consume("P1", {0: 300})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_edit_changes_the_tag_fields_and_keeps_the_counted_amount(self):
+        spool = self.store.update(UID, info={"type": "PETG", "brand": "SUNLU", "subtype": None, "color": "#2E7D32",
+                                             "nozzle_temp_min": 230, "nozzle_temp_max": 250}, weight=1000, note="Box 3")
+        self.assertEqual((spool["type"], spool["brand"], spool["subtype"], spool["color"]),
+                         ("PETG", "SUNLU", None, "#2E7D32"))
+        self.assertEqual((spool["nozzle_temp_min"], spool["nozzle_temp_max"], spool["note"]), (230, 250, "Box 3"))
+        # Still the same spool: counted amount, slot and statistics stay.
+        self.assertEqual((spool["remaining"], spool["slot"], spool["prints"], spool["used"]), (700.0, 0, 1, 300.0))
+        self.assertEqual(self.store.at("P1", 0)["id"], UID)
+        # Fields left out stay; reloading keeps the edit.
+        self.store.update(UID, info={"color": "#000000"})
+        again = SpoolStore(self.store.path).get(UID)
+        self.assertEqual((again["type"], again["brand"], again["color"]), ("PETG", "SUNLU", "#000000"))
+
+    def test_smaller_spool_caps_the_amount(self):
+        spool = self.store.update(UID, weight=500)
+        self.assertEqual((spool["weight"], spool["remaining"]), (500.0, 500.0))
+        self.assertEqual(SpoolStore.public(spool)["remaining_percent"], 100)
+
+    def test_override_replaces_the_counted_amount_and_keeps_the_statistics(self):
+        with self.assertRaises(ValueError):
+            self.store.update(UID, remaining=420)  # without the flag: refused, nothing changes
+        self.assertEqual(self.store.get(UID)["remaining"], 700.0)
+        spool = self.store.update(UID, remaining=420, override_remaining=True, info={"subtype": "Matte"})
+        self.assertEqual((spool["remaining"], spool["subtype"], spool["used"], spool["prints"]), (420.0, "Matte", 300.0, 1))
+        # The next print counts down from the weighed amount.
+        self.store.consume("P1", {0: 20})
+        self.assertEqual((spool["remaining"], spool["used"], spool["prints"]), (400.0, 320.0, 2))
+        # Never more than a full spool.
+        self.assertEqual(self.store.update(UID, remaining=1500, override_remaining=True)["remaining"], 1000.0)
+        with self.assertRaises(ValueError):
+            self.store.update(UID, override_remaining=True)  # the flag needs an amount
+
+    def test_invalid_edits_change_nothing(self):
+        before = dict(self.store.get(UID))
+        for edit in ({"info": {"type": None}}, {"info": {"color": ""}}, {"info": {"brand": "x" * 65}},
+                     {"info": {"nozzle_temp_max": 900}}, {"info": {"type": 5}}, {"weight": 0}, {"weight": -1},
+                     {"weight": "1000"}, {"weight": True}, {"remaining": -5, "override_remaining": True},
+                     {"info": {"type": "PETG"}, "weight": 20_000}, {"info": {"color": "#FFFFFF"}, "note": 5}):
+            with self.subTest(edit=edit), self.assertRaises(ValueError):
+                self.store.update(UID, **edit)
+        self.assertEqual(self.store.get(UID), before)
+        self.assertIsNone(self.store.update("0499999999", info={"type": "PLA"}))
+
+    def test_bambu_spools_cannot_be_edited(self):
+        self.store.sync_bambu("P1", tray(2, "PLA", "#FF0000FF", rfid=True, spool_uuid="ABC123", spool_weight=1000,
+                                         remain=40))
+        before = dict(self.store.get("bambu-ABC123"))
+        for edit in ({"info": {"color": "#000000"}}, {"info": {"brand": None}}, {"weight": 250},
+                     {"remaining": 10, "override_remaining": True}):
+            with self.subTest(edit=edit), self.assertRaises(ValueError):
+                self.store.update("bambu-ABC123", **edit)
+        self.assertEqual(self.store.get("bambu-ABC123"), before)
+        self.assertEqual(self.store.update("bambu-ABC123", note="Drybox")["note"], "Drybox")
+        self.assertFalse(SpoolStore.public(self.store.get("bambu-ABC123"))["editable"])
+        self.assertTrue(SpoolStore.public(self.store.get(UID))["editable"])
 
 
 class TrackerTests(unittest.IsolatedAsyncioTestCase):
@@ -281,7 +351,8 @@ class SpoolApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loaded["spool"]["id"], "04A1B2C3")
         listing = await (await self.client.get("/api/spools", headers=self.auth)).json()
         self.assertEqual([s["id"] for s in listing["spools"]], ["04A1B2C3"])
-        patched = await self.client.patch("/api/spools/04:a1:b2:c3", json={"remaining": 500}, headers=self.auth)
+        patched = await self.client.patch("/api/spools/04:a1:b2:c3", json={"remaining": 500, "override_remaining": True},
+                                          headers=self.auth)
         self.assertEqual((await patched.json())["spool"]["remaining"], 500.0)
         self.assertEqual((await self.client.delete("/api/spools/04A1B2C3", headers=self.auth)).status, 204)
         again = await (await self.client.post("/api/ams/spool", json=body, headers=self.auth)).json()
@@ -326,6 +397,58 @@ class SpoolApiTests(unittest.IsolatedAsyncioTestCase):
                                         headers={**self.auth, "Accept-Language": "de"})
         self.assertEqual((await german.json())["error"], "Ungültige Spulendaten (Sticker-ID oder Menge).")
         self.assertEqual((await self.client.post("/api/spools", json=body)).status, 401)
+
+
+    async def test_edit_a_tagged_spool(self):
+        body = {"uid": "04A1B2C3", "weight": 1000, "remaining": 800, "type": "PLA", "brand": "SUNLU",
+                "subtype": "Matte", "color": "#1A1A1A", "nozzle_temp_min": 200, "nozzle_temp_max": 230}
+        await self.client.post("/api/spools", json=body, headers=self.auth)
+        edit = {"type": "PETG", "brand": "Polymaker", "subtype": None, "color": "#2E7D32", "nozzle_temp_min": 230,
+                "nozzle_temp_max": 260, "weight": 750, "note": "Shelf 2"}
+        reply = await self.client.patch("/api/spools/04:a1:b2:c3", json=edit, headers=self.auth)
+        spool = (await reply.json())["spool"]
+        self.assertEqual(reply.status, 200)
+        self.assertEqual((spool["type"], spool["brand"], spool["subtype"], spool["color"], spool["weight"],
+                          spool["remaining"], spool["note"], spool["editable"]),
+                         ("PETG", "Polymaker", None, "#2E7D32", 750.0, 750.0, "Shelf 2", True))
+        # The amount changes only with the flag.
+        refused = await self.client.patch("/api/spools/04A1B2C3", json={**edit, "remaining": 300}, headers=self.auth)
+        self.assertEqual(refused.status, 422)
+        self.assertIn("override_remaining", (await refused.json())["error"])
+        german = await self.client.patch("/api/spools/04A1B2C3", json={"weight": 750, "remaining": 300},
+                                         headers={**self.auth, "Accept-Language": "de"})
+        self.assertEqual((await german.json())["error"],
+                         "Eine neue Restmenge ersetzt die von der Bridge gezählte Menge; dafür override_remaining: true mitsenden.")
+        overridden = await self.client.patch("/api/spools/04A1B2C3", headers=self.auth,
+                                             json={**edit, "remaining": 320, "override_remaining": True})
+        self.assertEqual((await overridden.json())["spool"]["remaining"], 320.0)
+        # Older apps correct the amount with `remaining` alone ("Adjust Amount"): an explicit override as well.
+        legacy = await self.client.patch("/api/spools/04A1B2C3", json={"remaining": 300}, headers=self.auth)
+        self.assertEqual((legacy.status, (await legacy.json())["spool"]["remaining"]), (200, 300.0))
+        for bad in ({"type": ""}, {"color": None}, {"weight": 0}, {"nozzle_temp_min": "hot"},
+                    {"override_remaining": "yes"}, {"override_remaining": True}, {"subtype": ["Matte"]}):
+            with self.subTest(bad=bad):
+                response = await self.client.patch("/api/spools/04A1B2C3", json=bad, headers=self.auth)
+                self.assertEqual(response.status, 422)
+        listing = await (await self.client.get("/api/spools", headers=self.auth)).json()
+        self.assertEqual([(s["type"], s["remaining"]) for s in listing["spools"]], [("PETG", 300.0)])
+        missing = await self.client.patch("/api/spools/0499999999", json={"type": "PLA"}, headers=self.auth)
+        self.assertEqual(missing.status, 404)
+
+    async def test_bambu_spools_refuse_edits(self):
+        from bridge.server import SPOOLS
+        store = self.client.app[SPOOLS]
+        store.sync_bambu("P1", {"slot": 0, "material": "PLA", "color": "#FFFFFFFF", "name": "PLA Basic",
+                                "spool_uuid": "ABC123", "spool_weight": 1000, "remain": 50})
+        for body in ({"color": "#000000"}, {"weight": 250}, {"remaining": 10, "override_remaining": True}):
+            with self.subTest(body=body):
+                response = await self.client.patch("/api/spools/bambu-ABC123", json=body,
+                                                   headers={**self.auth, "Accept-Language": "de"})
+                self.assertEqual(response.status, 422)
+                self.assertIn("AMS", (await response.json())["error"])
+        self.assertEqual(store.get("bambu-ABC123")["color"], "#FFFFFFFF")
+        noted = await self.client.patch("/api/spools/bambu-ABC123", json={"note": "Drybox"}, headers=self.auth)
+        self.assertEqual(((await noted.json())["spool"]["note"], noted.status), ("Drybox", 200))
 
 
 async def ServerTests_tearDown(helper):

@@ -188,7 +188,7 @@ printer. Jobs saved by 0.x bridges, which had no printer, are assigned to the de
 | POST | `/api/ams/spool` | Spool with an NFC tag in a slot: `{slot, uid, action: load\|write, choice: auto\|restore\|new, weight, remaining, type, brand, subtype, color, nozzle_temp_min, nozzle_temp_max}` → `{spool, decision}`; see Filament library |
 | GET | `/api/spools` | Filament library: all spools (Bambu and tagged) with remaining amount, share, length, location and statistics |
 | POST | `/api/spools` | Spool with an NFC tag added in the library, without a slot: the body of `/api/ams/spool` without `slot` → `{spool, decision}`; a new spool stays unloaded, a known one stays where it is; see Filament library |
-| PATCH / DELETE | `/api/spools/{id}` | Correct the remaining amount (tagged spools, grams as a number), note (text), `unload: true`; other types return 422 without changing anything; delete (kept as a tombstone for 180 days) |
+| PATCH / DELETE | `/api/spools/{id}` | Edit a spool: note (text), `unload: true`; for tagged spools also the tag fields (`type`, `brand`, `subtype`, `color`, `nozzle_temp_min`, `nozzle_temp_max`; null or `""` clears one, left out stays) and the full weight `weight`, and `remaining` (grams) only with `override_remaining: true` (`remaining` sent alone, as older apps do, also counts as an override); Bambu spools and invalid values return 422 without changing anything; see Filament library. Delete (kept as a tombstone for 180 days) |
 | POST | `/api/live/register` | app token: `{"kind": "start"\|"update"\|"alert", "token": "<hex>", "environment": "development"\|"production", "activity_id", "printer"?, "installation", "events", "language"?}`; `printer` names an update token's printer by the activity's `printerId` attribute (default printer if omitted). A new start or device token for the same installation (or device) replaces the old one. `alert` is the device token for notifications; `events` selects from `finished`, `failed`, `paused`, `error`; an empty list unregisters. Registrations belong to the paired device that made them (or to the shared access key): another credential cannot replace them, and a token registered by another device that is still paired returns 409, unless the same `installation` registers it again (the iPhone paired anew) |
 | DELETE | `/api/live/register?installation=<ID>` | remove the start, update and alert registrations this app installation made with the calling credential (its paired device, or the shared access key), for example when the app disconnects from the bridge → `{"removed": n}`. For a paired device, its registrations without an installation ID (older app versions) go too. 422 for a missing or invalid ID; older bridges answer 405 |
 
@@ -420,6 +420,22 @@ Writing a tag (`action: "write"`) keeps the counted amount when material and col
 spool with `remaining` (an opened spool; at most `weight`) or full; the app writes the returned `remaining` to the tag
 (`remaining_weight`). A Bambu spool that shows up
 again after being deleted simply returns.
+
+**Editing** (Bambro: Filament Library → spool → Edit Spool): the app reads the spool's tag first, writes the new
+data to it and then sends `PATCH /api/spools/{id}` while the phone is still on the tag; when the bridge refuses, the
+app writes the previous data back. The tag fields and `weight` use the same limits as a tag read (text up to 64
+characters, temperatures 0–500 °C, weight 1–10000 g); `type` and `color` cannot be cleared. Bambu spools take only a
+note and `unload` (422 otherwise): the AMS reports their filament, size and amount. An edit is the same spool: its
+slot, the counted amount and the statistics (prints, used grams, last used) stay, also when the material changes. A
+smaller `weight` caps the amount left at the new full weight.
+
+`remaining` replaces the amount the bridge counted and is accepted only with `override_remaining: true` (422 without
+it next to other fields, also `override_remaining` without `remaining`; `remaining` alone, as older apps send it, counts
+as an override), so a plain edit never resets the counting. Use it after weighing
+the spool. The statistics stay as they are: `used` keeps the grams booked by prints and is no longer
+`weight − remaining` after an override; the next print counts down from the new amount. A print that is running from
+the spool is booked in full when it ends, so weigh after the print. At most `weight` is kept. Listings and the status
+mark spools that take these fields with `editable: true` (tagged spools); older bridges leave it out.
 
 The status adds `spool` (same fields as `/api/spools`) to every slot with a known spool.
 

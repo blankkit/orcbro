@@ -49,8 +49,11 @@ Bambu-Spulen melden ihre Menge über den Chip (mit „Restmenge schätzen“ in 
 einmal einen NFC-Sticker beschreiben (Filament, Farbe, Spulengröße) und ihn beim Einlegen lesen: Die Bridge zieht dann
 ab, was jeder Druck verbraucht, auch bei Drucken aus OrcaSlicer oder Bambu Studio, und Bambro schreibt die aktuelle
 Menge bei jedem Lesen auf den Sticker. Eine Spule, die noch nicht im AMS ist, fügst du in der Bibliothek mit „Spule
-hinzufügen“ hinzu: Bambro liest den Sticker oder beschreibt einen leeren. Versehentlich gelöscht? Sticker erneut lesen
-und „Wiederherstellen“ wählen. Der Demo-Drucker zeigt Beispielspulen in der Bibliothek.
+hinzufügen“ hinzu: Bambro liest den Sticker oder beschreibt einen leeren. Zum Ändern öffnest du die Spule in der
+Bibliothek und tippst auf „Spule bearbeiten“: Bambro liest zuerst ihren Sticker und schreibt die Änderungen auf den
+Sticker und in die Bibliothek. Die Restmenge änderst du nur nach dem Wiegen, denn sie ersetzt die von der Bridge
+gezählte Menge. Versehentlich gelöscht? Sticker erneut lesen und „Wiederherstellen“ wählen. Der Demo-Drucker zeigt
+Beispielspulen in der Bibliothek.
 
 **Warum zeigt eine neue Spule Generic PLA in Grau?** Kommt eine Spule ohne Bambu-Chip in ein AMS-Fach, würde der
 Drucker wieder Filament und Farbe der vorigen Spule nehmen. Stattdessen wird das Fach auf Generic desselben Materials
