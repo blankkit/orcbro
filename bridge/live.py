@@ -3,7 +3,11 @@
 The app registers one push-to-start token per device and one update token per Live Activity.
 Every print, including those started in OrcaSlicer, starts an activity on all registered devices.
 The app then registers update tokens. Progress updates are throttled to once per minute; pauses
-and errors are sent immediately. An end event sends final status.
+and errors are sent immediately.
+
+A finished, failed or canceled print stays on the Lock Screen with its final status, sent as an update
+rather than an end event so the activity stays under the bridge's control. It is ended and removed when
+the next print starts, before that print's activity, so only one is shown; otherwise after `DISMISS_AFTER`.
 
 Persist tokens and current prints in `push.json` so restarting during a print does not start
 duplicate activities. `ATTRIBUTES_TYPE` and `content_state` keys match the app's
@@ -40,7 +44,7 @@ ENDED = {"FINISH", "FAILED", "IDLE"}
 UPDATE_INTERVAL = 60       # Seconds between progress-only updates.
 HEARTBEAT = 10 * 60        # Maximum interval between updates to keep the display fresh.
 STALE_AFTER = 20 * 60      # The iPhone marks status stale after this interval.
-DISMISS_AFTER = 60 * 60    # Keep the ended activity on the Lock Screen for this long.
+DISMISS_AFTER = 60 * 60    # Keep a finished print on the Lock Screen for this long.
 ENVIRONMENTS = ("development", "production")
 
 
@@ -273,9 +277,11 @@ class LiveActivities:
         current = self.push.current
         if job["state"] in ACTIVE:
             key = f"{job.get('name')}|{job.get('file')}"
-            if current is None or current.get("key") != key:
+            # A finished print of the same file printed again is a new print.
+            if current is None or current.get("key") != key or current.get("ended"):
+                # The previous print's activity, finished or not, goes before the new one starts.
+                await self._dismiss((current or {}).get("state") or self._last or state, now)
                 self.push.current = {"key": key, "started": now}
-                self.push.activities.clear()  # Tokens belong to earlier prints' Live Activities.
                 self.push.save()
                 await self._start(state, now)
                 self._remember(state, now)
@@ -287,11 +293,24 @@ class LiveActivities:
                 await self._send_all(self.push.activities, self._payload("update", state, now), 10 if major else 5)
                 self._remember(state, now)
         elif current is not None and job["state"] in ENDED:
-            await self._send_all(self.push.activities, self._payload("end", state, now), 10)
-            self.push.current = None
-            self.push.activities.clear()
-            self.push.save()
-            self._last = None
+            if not current.get("ended"):
+                # Final status as an update, so the next print can still remove it.
+                await self._send_all(self.push.activities, self._payload("update", state, now), 10)
+                current.update(ended=now, state=state)
+                self.push.save()
+                self._last = None
+            elif now - current["ended"] >= DISMISS_AFTER:
+                await self._dismiss(current.get("state") or state, now)
+                self.push.current = None
+                self.push.save()
+
+    async def _dismiss(self, state: dict, now: float) -> None:
+        """Remove the current activity from the Lock Screen right away and forget its update tokens."""
+        if self.push.activities:
+            payload = self._payload("end", state, now)
+            payload["aps"]["dismissal-date"] = int(now)
+            await self._send_all(self.push.activities, payload, 10)
+        self.push.activities.clear()
 
     def _remember(self, state: dict, now: float) -> None:
         self._last, self._last_at = state, now
@@ -300,6 +319,9 @@ class LiveActivities:
         aps: dict = {"timestamp": int(now), "event": event, "content-state": state}
         if event == "end":
             aps["dismissal-date"] = int(now + DISMISS_AFTER)
+        elif state["phase"] in ENDED:
+            # A finished print does not change any more: not stale until it is removed.
+            aps["stale-date"] = int(now + DISMISS_AFTER + STALE_AFTER)
         else:
             aps["stale-date"] = int(now + STALE_AFTER)
         return {"aps": aps}

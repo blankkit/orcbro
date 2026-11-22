@@ -244,7 +244,10 @@ class PushLanguageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(apns_payload(item)["aps"]["alert"]["title"],
                                  "Druck pausiert" if token == "de" else "Print Paused")
             await live.process(status(state="FINISH"), now=1003)
-            self.assertEqual(len([entry for entry in apns.sent if entry[2]["aps"]["event"] == "end"]), 2)
+            final = [entry for entry in apns.sent[-2:] if entry[2]["aps"]["event"] == "update"]
+            self.assertEqual(len(final), 2)
+            for token, _, payload, _ in final:
+                self.assertEqual(payload["language"], token)
             reloaded = Registry(registry.path)
             self.assertEqual(reloaded.start["de"]["language"], "de")
             self.assertEqual(reloaded.alerts["en"]["language"], "en")

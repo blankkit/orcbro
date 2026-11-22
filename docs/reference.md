@@ -52,8 +52,9 @@ Detailed description of behavior, Brotocol (HTTP API) and architecture. For an i
 - **Live Activity:** on paired iPhones' Lock Screen and Dynamic Island through APNs (`live.py`, `apns.py`). When a
   print starts, whether from the app or OrcaSlicer, the bridge starts the activity through push to start; then sends
   updates (progress at most once a minute, pauses/errors/preparation steps immediately, otherwise every 10 minutes),
-  and finally an `end` event with the final state (visible for one hour). Tokens and the current print are stored in
-  `/data/push.json`. Texts use the language registered for each token.
+  and finally the final state as an update. That stays visible for one hour, then an `end` event removes it; when the
+  next print starts earlier, the bridge removes it first, so each printer shows one activity. Tokens and the current
+  print are stored in `/data/push.json`. Texts use the language registered for each token.
 - **Printing:** the bridge accepts the job immediately (202) and sends it in the background: wait for the printer,
   upload over FTPS (990, implicit TLS, without TLS shutdown on the data channel), check the size on the card, send
   `project_file` over MQTT with AMS mapping, then wait for the printer to report "Preparing/Printing". Up to three

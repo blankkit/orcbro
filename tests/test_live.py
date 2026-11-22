@@ -116,15 +116,45 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
         await self.live.process(status(state="PAUSE", progress=3), now=1080)  # Pause is immediate.
         self.assertEqual(self.apns.events("bb" * 32)[-1], ("update", 10))
 
+        # Finished: final status as an update, so the activity can still be removed later.
         await self.live.process(status(state="FINISH", progress=100), now=2000)
         _, _, payload, _ = self.apns.sent[-1]
-        self.assertEqual(payload["aps"]["event"], "end")
+        self.assertEqual(payload["aps"]["event"], "update")
         self.assertEqual(payload["aps"]["content-state"]["phase"], "FINISH")
-        self.assertEqual(payload["aps"]["dismissal-date"], 2000 + 3600)
+        self.assertGreater(payload["aps"]["stale-date"], 2000 + 3600)
+        await self.live.process(status(state="FINISH", progress=100), now=2010)
+        self.assertEqual(len(self.apns.events("bb" * 32)), 4)  # No second final update.
+        # Nothing new for an hour: end and remove it.
+        await self.live.process(status(state="FINISH", progress=100), now=2000 + 3600)
+        _, _, payload, _ = self.apns.sent[-1]
+        self.assertEqual((payload["aps"]["event"], payload["aps"]["dismissal-date"]), ("end", 2000 + 3600))
+        self.assertEqual(payload["aps"]["content-state"]["phase"], "FINISH")
         self.assertIsNone(self.live.push.current)
         self.assertEqual(self.live.push.activities, {})
-        await self.live.process(status(state="FINISH", progress=100), now=2010)
-        self.assertEqual(self.apns.sent[-1][2]["aps"]["event"], "end")  # No duplicate end.
+        await self.live.process(status(state="FINISH", progress=100), now=6000)
+        self.assertEqual(len(self.apns.events("bb" * 32)), 5)
+
+    async def test_next_print_replaces_the_finished_one(self):
+        """A print started (for example in OrcaSlicer) after a finished one: one activity, not two."""
+        await self.live.process(status(state="RUNNING", progress=50), now=1000)
+        self.registry.add("update", "bb" * 32, "development", "act-1")
+        await self.live.process(status(state="FINISH", progress=100), now=2000)
+        nxt = status(state="PREPARE", progress=0)
+        nxt["job"]["name"] = "Zweiter Druck"
+        await self.live.process(nxt, now=2100)
+        events = [(token, payload["aps"]["event"]) for token, _, payload, _ in self.apns.sent]
+        self.assertEqual(events[-2:], [("bb" * 32, "end"), ("aa" * 32, "start")])
+        ended = self.apns.sent[-2][2]["aps"]
+        self.assertEqual(ended["dismissal-date"], 2100)  # Removed right away …
+        self.assertEqual(ended["content-state"]["phase"], "FINISH")  # … showing the old print, not the new one.
+        self.assertEqual(self.live.push.activities, {})
+        self.assertNotIn("ended", self.live.push.current)
+
+    async def test_same_file_printed_again_is_a_new_print(self):
+        await self.live.process(status(state="RUNNING"), now=1000)
+        await self.live.process(status(state="FINISH"), now=2000)
+        await self.live.process(status(state="RUNNING"), now=2100)
+        self.assertEqual([e for e, _ in self.apns.events()].count("start"), 2)
 
     async def test_restart_mid_print_does_not_start_again(self):
         await self.live.process(status(state="RUNNING"), now=1000)
