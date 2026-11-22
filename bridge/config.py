@@ -52,7 +52,12 @@ class Config:
     tls_key: Path | None = None
     public_url: str | None = None
     trusted_proxies: tuple[str, ...] = ()
+    # With BRIDGE_TLS=off and no trusted proxies, the API answers plain HTTP from every peer; that needs this
+    # explicit opt-in (BRIDGE_PLAIN_HTTP=on), for example on an isolated network or inside a VPN.
+    plain_http: bool = False
     mdns: bool = True
+    # A chipless spool inserted into an AMS slot is set to Generic <previous material> in gray (newspool.py).
+    reset_new_spools: bool = True
     # Relay for Live Activity pushes without an APNs key. Environment configuration defaults to the
     # public relay; BRIDGE_PUSH_RELAY=off disables it. Direct configurations, such as tests, have none.
     push_relay: str | None = None
@@ -126,7 +131,8 @@ class Config:
                 raise ConfigError(m("BRIDGE_PUSH_RELAY must be an https address or 'off'."))
             else:
                 kwargs["push_relay"] = relay.rstrip("/")
-        for variable, attribute in (("BRIDGE_TLS", "tls"), ("BRIDGE_MDNS", "mdns")):
+        for variable, attribute in (("BRIDGE_TLS", "tls"), ("BRIDGE_MDNS", "mdns"), ("BRIDGE_PLAIN_HTTP", "plain_http"),
+                                    ("BRIDGE_RESET_NEW_SPOOLS", "reset_new_spools")):
             value = env.get(variable, "").strip().lower()
             if value:
                 if value not in {"on", "off"}:
@@ -151,6 +157,8 @@ class Config:
                     ipaddress.ip_network(network, strict=False)
             except ValueError as exc:
                 raise ConfigError(f"BRIDGE_TRUSTED_PROXIES: {exc}") from exc
+        if not kwargs.get("tls", True) and not kwargs.get("trusted_proxies") and not kwargs.get("plain_http"):
+            raise ConfigError(m('BRIDGE_TLS=off needs BRIDGE_TRUSTED_PROXIES (the reverse proxy that terminates HTTPS). To serve the API over plain HTTP to every device on the network instead, set BRIDGE_PLAIN_HTTP=on.'))
         for attribute, variable in (("port", "PORT"), ("https_port", "BRIDGE_HTTPS_PORT")):
             port = kwargs.get(attribute, getattr(cls, attribute))
             if not 1 <= port <= 65535:

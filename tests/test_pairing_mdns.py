@@ -16,7 +16,7 @@ class FakeZeroconf:
     async def async_register_service(self, info, allow_name_change=False):
         self.registered = (info, allow_name_change)
         if allow_name_change:
-            info.name = "Test-2._orcabridge._tcp.local."
+            info.name = "Test-2._orcbro._tcp.local."
 
     async def async_unregister_service(self, info):
         self.unregistered = info

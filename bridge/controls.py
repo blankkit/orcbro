@@ -4,7 +4,8 @@ Network-free logic keeps every rule testable:
 - Movement, extrusion and filament changes require no running print.
 - Temperatures and fans can change during printing, within fixed limits.
 - Objects can be skipped only while printing, only known IDs, and never all objects.
-- Print options and message acknowledgment are always allowed, as in Bambu Studio.
+- Print options and message acknowledgment are always allowed, as in Bambu Studio. Recovery actions for a display
+  message are those Bambu Studio offers for its code (recovery.py).
 - Calibration requires no running print because the printer moves, heats and vibrates.
 - Reading a spool chip again requires no running print and no filament from that slot in the toolhead.
 - Drying requires a heated AMS (AMS 2 Pro or AMS HT), remote firmware support, the AMS temperature
@@ -16,6 +17,7 @@ from .i18n import m, join_messages
 
 from dataclasses import dataclass
 
+from . import recovery
 from .models import _version
 from .state import EXTERNAL_SLOT
 
@@ -172,7 +174,9 @@ def build(action: str, value, status: dict, objects: list[dict] | None = None,
         # Bambu: spools inserted during a print are read only after it; a loaded spool cannot be turned.
         need(IDLE, m('The AMS reads spool chips only when no print is running.'))
         tray = find_tray(status, value)
-        if tray is None or tray.get("ams") is None:
+        # External spools have no chip reader, also when reported through `vir_slot` (AMS ID 254 or 255).
+        if tray is None or tray.get("ams") is None or tray["ams"] in (254, 255) \
+                or (tray.get("source") or {}).get("ams_id") in (254, 255):
             raise ControlError(422, m('Slot not found or external spool (it has no chip reader).'))
         if tray["slot"] == status["ams"].get("active_slot"):
             raise ControlError(409, m('Filament from this slot is in the toolhead. Unload it first.'))
@@ -324,8 +328,31 @@ def clear_error(status: dict) -> tuple[Command, Command]:
         raise ControlError(409, m('The printer is not showing a message.'))
     return (("print", {"command": "clean_print_error", "subtask_id": status["job"].get("subtask_id") or "",
                        "print_error": value}),
-            ("system", {"command": "uiop", "name": "print_error", "action": "close", "source": 1, "type": "dialog",
-                        "err": f"{value:08X}"}))
+            close_dialog(value))
+
+
+def close_dialog(value: int) -> Command:
+    """Close the message dialog on the printer's screen (`uiop`), naming the message."""
+    return ("system", {"command": "uiop", "name": "print_error", "action": "close", "source": 1, "type": "dialog",
+                       "err": f"{value:08X}"})
+
+
+def error_action(value, status: dict) -> tuple[Command, Command]:
+    """A recovery action for the display message: {"code": "0700_8011", "action": <job.error.actions>}.
+
+    The code must still be the printer's message, so a tap never answers a newer message. Like Bambu Studio's error
+    dialog, send the action, then close the dialog."""
+    error = status["job"].get("error")
+    code, action = _get(value, "code"), _get(value, "action")
+    if not isinstance(code, str) or not isinstance(action, str):
+        raise ControlError(422, m('Expected the message code and an action.'))
+    if not error:
+        raise ControlError(409, m('The printer is not showing a message.'))
+    if code != error["code"]:
+        raise ControlError(409, m('The printer is now showing a different message.'))
+    if action not in (error.get("actions") or []):
+        raise ControlError(409, m('This action is not available for the message.'))
+    return recovery.command(action, error["value"], status["job"].get("job_id") or ""), close_dialog(error["value"])
 
 
 def tray_setting(slot: int, info: dict, color: str, source: dict | None = None, colors: list | None = None,

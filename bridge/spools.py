@@ -3,7 +3,8 @@
 Bambu spools carry a chip the AMS reads; it reports a unique spool ID, the full weight and an estimated remaining
 percentage, so the bridge only records what it sees. Third-party tags are invisible to the AMS: Bambro reads the tag
 when a spool is loaded and tells the bridge which spool (tag UID) sits in which slot, and the bridge keeps the books.
-After every print it subtracts what the print used from each slot's spool; the app writes the current amount back to
+Spools can also be added in the library without a slot; they are placed when their tag is read for a slot. After
+every print it subtracts what the print used from each slot's spool; the app writes the current amount back to
 the tag whenever the phone touches it again.
 
 Usage per slot comes from the sliced file (grams per filament on the printed plate):
@@ -40,6 +41,19 @@ DENSITY = {"PLA": 1.24, "PETG": 1.27, "ABS": 1.04, "ASA": 1.07, "TPU": 1.21, "PC
            "PVA": 1.23, "HIPS": 1.04, "PET": 1.38, "PPS": 1.36, "PLA-CF": 1.29, "PETG-CF": 1.29, "PA-CF": 1.20}
 CROSS_SECTION_CM2 = 3.14159265 * 0.0875 ** 2
 TAG_FIELDS = ("type", "brand", "subtype", "color", "nozzle_temp_min", "nozzle_temp_max")
+# After a tag is read or written for a slot, an empty slot does not unload the spool yet: the app sets the filament
+# only after the NFC session, and the spool may go in after its tag was read.
+PLACE_GRACE = 120
+# Tag data from the app: short text and plausible temperatures.
+TAG_TEXT_LIMITS = {"type": 64, "brand": 64, "subtype": 64, "color": 32}
+MAX_TEMPERATURE = 500
+SPOOL_TEXT = ("type", "brand", "subtype", "color", "note", "printer")
+SPOOL_NUMBERS = ("weight", "remaining", "remaining_percent", "used", "nozzle_temp_min", "nozzle_temp_max",
+                 "created", "updated", "last_used", "deleted", "placed")
+
+
+class BambuAmount(ValueError):
+    """The AMS reports the amount of Bambu spools; it cannot be set."""
 
 
 def trays_of(status: dict) -> list[dict]:
@@ -51,7 +65,7 @@ def trays_of(status: dict) -> list[dict]:
 
 
 def _rgb(color: str | None) -> tuple[int, int, int] | None:
-    text = (color or "").strip().lstrip("#")
+    text = (color if isinstance(color, str) else "").strip().lstrip("#")
     if len(text) < 6:
         return None
     try:
@@ -68,7 +82,7 @@ def _color_distance(a: str | None, b: str | None) -> float:
 
 
 def _same_type(a: str | None, b: str | None) -> bool:
-    return bool(a and b) and a.strip().upper() == b.strip().upper()
+    return isinstance(a, str) and isinstance(b, str) and bool(a and b) and a.strip().upper() == b.strip().upper()
 
 
 def same_filament(spool: dict, info: dict) -> bool:
@@ -79,7 +93,7 @@ def same_filament(spool: dict, info: dict) -> bool:
 def length_m(grams: float | None, material: str | None) -> float | None:
     if grams is None:
         return None
-    density = DENSITY.get((material or "").upper().strip(), 1.24)
+    density = DENSITY.get((material if isinstance(material, str) else "").upper().strip(), 1.24)
     return round(grams / (density * CROSS_SECTION_CM2 * 100), 1)
 
 
@@ -140,13 +154,50 @@ def _rounded(usage: dict[int, float]) -> dict[int, float]:
     return {slot: round(grams, 1) for slot, grams in usage.items() if grams > 0}
 
 
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _grams(value: float | None) -> float | None:
     if value is None:
         return None
+    if not _is_number(value):
+        raise ValueError("grams")
     grams = float(value)
     if not 0 <= grams <= MAX_GRAMS:
         raise ValueError("grams")
     return round(grams, 1)
+
+
+def tag_info(info: dict | None) -> dict:
+    """Filament data from a tag, validated before anything changes: short text for type, brand, subtype and
+    color, numbers for the temperatures. Empty values are left out; anything else raises ValueError."""
+    out = {}
+    for key, value in (info or {}).items():
+        if key not in TAG_FIELDS or value in (None, ""):
+            continue
+        if key in TAG_TEXT_LIMITS:
+            if not isinstance(value, str) or len(value) > TAG_TEXT_LIMITS[key]:
+                raise ValueError(key)
+        elif not _is_number(value) or not 0 <= value <= MAX_TEMPERATURE:
+            raise ValueError(key)
+        out[key] = value
+    return out
+
+
+def valid_spool(key, spool) -> bool:
+    """A stored spool record has the types the bridge writes; damaged records are set aside on load."""
+    if not isinstance(key, str) or not isinstance(spool, dict):
+        return False
+    if spool.get("id", key) != key or spool.get("kind", "tag") not in ("tag", "bambu"):
+        return False
+    if not all(spool.get(field) is None or isinstance(spool[field], str) for field in SPOOL_TEXT):
+        return False
+    if not all(spool.get(field) is None or _is_number(spool[field]) for field in SPOOL_NUMBERS):
+        return False
+    slot, prints = spool.get("slot"), spool.get("prints")
+    return (slot is None or isinstance(slot, int) and not isinstance(slot, bool)) and (
+        prints is None or isinstance(prints, int) and not isinstance(prints, bool))
 
 
 class SpoolStore:
@@ -159,8 +210,18 @@ class SpoolStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
-        self.spools: dict[str, dict] = data.get("spools", {})
-        self.printing: dict[str, dict] = data.get("printing", {})
+        data = data if isinstance(data, dict) else {}
+        stored = data.get("spools") if isinstance(data.get("spools"), dict) else {}
+        self.printing: dict[str, dict] = data.get("printing") if isinstance(data.get("printing"), dict) else {}
+        # Damaged records stay in the file under `damaged` but out of the library, so they cannot break requests.
+        self.damaged: dict = data.get("damaged") if isinstance(data.get("damaged"), dict) else {}
+        self.spools: dict[str, dict] = {}
+        for key, spool in stored.items():
+            if valid_spool(key, spool):
+                self.spools[key] = spool
+            else:
+                log.warning("Spool %s in %s is damaged and was set aside", str(key)[:40], self.path.name)
+                self.damaged[str(key)] = spool
         cutoff = time.time() - TOMBSTONE_DAYS * 86400
         self.spools = {k: v for k, v in self.spools.items() if not v.get("deleted") or v["deleted"] > cutoff}
         for key, spool in self.spools.items():
@@ -172,7 +233,8 @@ class SpoolStore:
             tmp = self.path.with_suffix(".tmp")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"spools": self.spools, "printing": self.printing}, handle, indent=1)
+                json.dump({"spools": self.spools, "printing": self.printing,
+                           **({"damaged": self.damaged} if self.damaged else {})}, handle, indent=1)
             tmp.replace(self.path)
 
     @staticmethod
@@ -216,9 +278,10 @@ class SpoolStore:
                 "created": now, "updated": now, "last_used": None, "prints": 0, "used": 0.0, "note": None,
                 "printer": None, "slot": None}
 
-    def load(self, printer: str, slot: int, uid: str, *, weight: float | None, remaining: float | None = None,
-             info: dict | None = None, choice: str = "auto") -> tuple[dict | None, dict]:
-        """A tag was read in `slot`. Returns (spool, outcome); outcome `decision` is `loaded`, `new`, `restored` or
+    def load(self, printer: str | None, slot: int | None, uid: str, *, weight: float | None,
+             remaining: float | None = None, info: dict | None = None, choice: str = "auto") -> tuple[dict | None, dict]:
+        """A tag was read in `slot` of `printer`, or in the filament library (`slot` None: a new spool stays unloaded,
+        a known one stays where it is). Returns (spool, outcome); outcome `decision` is `loaded`, `new`, `restored` or
         `choose` (spool is None: the tag belongs to a deleted spool with the same filament, the user decides).
 
         A known spool keeps the bridge's amount (it counted the prints); a new one starts with the amount on the tag,
@@ -226,7 +289,7 @@ class SpoolStore:
         new spool; the same data needs a decision, suggesting "new" when the old spool was nearly empty (tag moved to
         a fresh spool) and "restore" otherwise (deleted by mistake)."""
         uid = self.normalize_uid(uid)
-        info = {k: v for k, v in (info or {}).items() if k in TAG_FIELDS and v not in (None, "")}
+        info = tag_info(info)
         weight, remaining = _grams(weight), _grams(remaining)
         spool = self.spools.get(uid)
         decision = "loaded"
@@ -250,18 +313,18 @@ class SpoolStore:
         if spool.get("remaining") is None:
             spool["remaining"] = remaining if remaining is not None else weight
         spool.update(info)
-        self._place(spool, printer, slot)
-        spool["updated"] = time.time()
+        self._placed(spool, printer, slot)
         self.save()
         return spool, {"decision": decision}
 
     def written(self, printer: str | None, slot: int | None, uid: str, *, weight: float | None,
-                info: dict | None = None) -> tuple[dict, dict]:
-        """A tag is (re)written. Same filament as the known spool: keep the counted amount, update the weight. Other
-        filament or unknown/deleted tag: a new spool that starts full."""
+                remaining: float | None = None, info: dict | None = None) -> tuple[dict, dict]:
+        """A tag is (re)written, for `slot` of `printer` or in the filament library (`slot` None). Same filament as
+        the known spool: keep the counted amount, update the weight. Other filament or unknown/deleted tag: a new
+        spool that starts with `remaining`, else full."""
         uid = self.normalize_uid(uid)
-        info = {k: v for k, v in (info or {}).items() if k in TAG_FIELDS and v not in (None, "")}
-        weight = _grams(weight)
+        info = tag_info(info)
+        weight, remaining = _grams(weight), _grams(remaining)
         spool = self.spools.get(uid)
         if spool is not None and not spool.get("deleted") and same_filament(spool, info):
             if weight is not None:
@@ -270,15 +333,21 @@ class SpoolStore:
                     spool["remaining"] = weight
             decision = "updated"
         else:
-            spool = self._fresh(uid, "tag", weight, weight)
+            start = weight if remaining is None else remaining if weight is None else min(remaining, weight)
+            spool = self._fresh(uid, "tag", weight, start)
             self.spools[uid] = spool
             decision = "new"
         spool.update(info)
-        if slot is not None:
-            self._place(spool, printer, slot)
-        spool["updated"] = time.time()
+        self._placed(spool, printer, slot)
         self.save()
         return spool, {"decision": decision}
+
+    def _placed(self, spool: dict, printer: str | None, slot: int | None) -> None:
+        """After a tag was read or written: into the slot when there is one, otherwise the spool stays where it is."""
+        spool["updated"] = time.time()
+        if slot is not None:
+            self._place(spool, printer, slot)
+            spool["placed"] = spool["updated"]
 
     def sync_bambu(self, printer: str, tray: dict) -> bool:
         """Record a Bambu spool the AMS reports in a slot. Returns True when something changed."""
@@ -317,15 +386,31 @@ class SpoolStore:
             self.save()
         return spool
 
+    def unload_printer(self, printer: str) -> int:
+        """A printer was removed: its spools are no longer in any slot, and its print in progress is forgotten."""
+        spools = [s for s in self.library() if s.get("printer") == printer]
+        for spool in spools:
+            spool["printer"] = spool["slot"] = None
+            spool["updated"] = time.time()
+        printing = self.printing.pop(printer, None)
+        if spools or printing is not None:
+            self.save()
+        return len(spools)
+
     def update(self, spool_id: str, *, remaining: float | None = None, note: str | None = None,
                unload: bool = False) -> dict | None:
         spool = self.get(spool_id)
         if spool is None:
             return None
+        # Validate everything before changing anything.
         if remaining is not None:
             if spool["kind"] == "bambu":
-                raise ValueError("bambu")
-            spool["remaining"] = _grams(remaining)
+                raise BambuAmount("bambu")
+            remaining = _grams(remaining)
+        if note is not None and not isinstance(note, str):
+            raise ValueError("note")
+        if remaining is not None:
+            spool["remaining"] = remaining
         if note is not None:
             spool["note"] = note.strip()[:200] or None
         if unload:
@@ -379,6 +464,14 @@ class SpoolStore:
 
 
 Plan = tuple[list[dict], dict[int, int] | None]
+
+
+def _removed(tray: dict) -> bool:
+    """The AMS reports the slot physically empty. A spool whose filament is unknown (`present` without `material`, as
+    the P1 series reports a newly inserted chipless spool until its filament is set) is still in the slot; units
+    without exist bits (`present` unknown) only report `empty`."""
+    present = tray.get("present")
+    return present is False or (present is None and bool(tray.get("empty")))
 
 
 class SpoolTracker:
@@ -479,17 +572,20 @@ class SpoolTracker:
 
     def _sync_trays(self, status: dict) -> bool:
         changed = False
+        now = time.time()
         for tray in trays_of(status):
             if tray.get("rfid") and tray.get("spool_uuid"):
                 changed |= self.store.sync_bambu(self.printer_id, tray)
                 continue
+            spool = self.store.at(self.printer_id, tray["slot"])
+            if spool is None:
+                continue
             # External spools have no sensor; they stay until another spool is read for that slot.
-            if tray.get("empty") and tray["slot"] < 254 or tray.get("rfid"):
-                spool = self.store.at(self.printer_id, tray["slot"])
-                if spool is not None:
-                    spool["printer"] = spool["slot"] = None
-                    spool["updated"] = time.time()
-                    changed = True
+            emptied = tray["slot"] < 254 and _removed(tray) and now - (spool.get("placed") or 0) >= PLACE_GRACE
+            if emptied or tray.get("rfid"):
+                spool["printer"] = spool["slot"] = None
+                spool["updated"] = now
+                changed = True
         if changed:
             self.store.save()
         return changed

@@ -9,6 +9,7 @@ import time
 from urllib.parse import quote
 
 from .camera import IDLE_STOP, MAX_FRAME
+from .trust import CHANGED, CertificateChanged
 
 log = logging.getLogger(__name__)
 
@@ -45,17 +46,21 @@ class MjpegParser:
         return frames
 
 
+RTSPS_PORT = 322
+
+
 def stream_url(host: str, access_code: str) -> str:
     """RTSPS URL with configured host; encode the access code only as part of the URL."""
     address = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    return f"rtsps://bblp:{quote(access_code, safe='')}@{address}:322/streaming/live/1"
+    return f"rtsps://bblp:{quote(access_code, safe='')}@{address}:{RTSPS_PORT}/streaming/live/1"
 
 
 class RtspCamera:
     def __init__(self, host: str, access_code: str, trust=None):
         self.host = host
         self._code = access_code
-        # ffmpeg cannot check the pin: verify the MQTT-port certificate fingerprint before each start.
+        # ffmpeg cannot check the pin: before each start, a TLS handshake on the RTSPS port itself must present
+        # the pinned printer certificate. ffmpeg then opens its own connection with the access code.
         self.trust = trust
         self.frame: bytes | None = None
         self.frame_at: float | None = None
@@ -116,7 +121,7 @@ class RtspCamera:
             parser = MjpegParser()
             try:
                 if self.trust is not None:
-                    await self.trust.check(self.host)
+                    await self.trust.check(self.host, RTSPS_PORT)
                 self._process = await asyncio.create_subprocess_exec(
                     "ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp", "-tls_verify", "0",
                     "-i", stream_url(self.host, self._code), "-an", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
@@ -133,6 +138,11 @@ class RtspCamera:
                             self._new.notify_all()
             except asyncio.CancelledError:
                 raise
+            except CertificateChanged:
+                self.error = CHANGED
+                log.warning(m('RTSPS camera: the certificate on the camera port does not match the printer; ffmpeg was not started'))
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
             except Exception:  # Never log the access code or ffmpeg output.
                 self.error = m('No camera image. Check LAN Liveview on the printer.')
                 log.warning(m('RTSPS camera unavailable; check LAN Liveview'))

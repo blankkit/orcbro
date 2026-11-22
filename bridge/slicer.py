@@ -4,10 +4,12 @@ from __future__ import annotations
 from .i18n import m, message_of
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
+import signal
 from pathlib import Path
 
 from .jobs import JobError, read_slice_info
@@ -52,7 +54,7 @@ class Slicer:
                     colors: list[str | None] | None = None, orient: bool = False, copies: int = 1) -> dict:
         """Slice `model` into `output` and return plates, time, weight and filament information."""
         async with self._lock:
-            shutil.rmtree(workdir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, workdir, ignore_errors=True)
             (workdir / "out").mkdir(parents=True)
             (workdir / "datadir").mkdir()
             settings: list[Path] = []
@@ -67,30 +69,47 @@ class Slicer:
                    "LIBGL_ALWAYS_SOFTWARE": "1", "LC_ALL": "C"}
             (workdir / "xdg").mkdir(mode=0o700)
             log.info("Slice: %s", " ".join(args))
+            # Own process group: xvfb-run starts Xvfb and OrcaSlicer as children, which must end with it.
             proc = await asyncio.create_subprocess_exec(
-                *args, cwd=workdir, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                *args, cwd=workdir, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True)
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), self.timeout)
             except TimeoutError:
-                proc.kill()
-                await proc.wait()
+                await _kill(proc)
                 raise SliceError(m('Slicing canceled after {p0} minutes.', p0=self.timeout // 60)) from None
+            except asyncio.CancelledError:
+                await _kill(proc)  # Bridge shutdown: do not leave the slicer running.
+                raise
             log_text = stdout.decode(errors="replace")
             (workdir / "slicer.log").write_text(log_text, encoding="utf-8")
             produced = workdir / "out" / output.name
             report = _read_result(workdir / "out" / "result.json")
             if proc.returncode != 0 or not produced.exists():
                 raise SliceError(_failure_text(report, log_text, proc.returncode))
-            shutil.move(produced, output)
             try:
-                info = read_slice_info(output)
+                # Reading the result decompresses and scans every plate's G-code: keep it off the event loop.
+                info = await asyncio.to_thread(_finish, produced, output, workdir)
             except JobError as exc:
                 raise SliceError(message_of(exc)) from exc
             info["warnings"] = [m(w) if isinstance(w, str) else w for w in (report or {}).get("warnings", []) if w]
             info["plate"] = plate if kind == "project" else 1
-            # The work directory contains only intermediate files; the result is in `output`.
-            shutil.rmtree(workdir / "datadir", ignore_errors=True)
             return info
+
+
+def _finish(produced: Path, output: Path, workdir: Path) -> dict:
+    """Move the result into place and read it; then drop the intermediate files, which are no longer needed."""
+    shutil.move(produced, output)
+    info = read_slice_info(output)
+    shutil.rmtree(workdir / "datadir", ignore_errors=True)
+    return info
+
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    """End the slicer and everything it started."""
+    with contextlib.suppress(ProcessLookupError):  # Already gone.
+        os.killpg(proc.pid, signal.SIGKILL)
+    await proc.wait()
 
 
 def _read_result(path: Path) -> dict | None:

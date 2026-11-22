@@ -15,7 +15,7 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from .branding import LEGACY_TOKEN_CONTEXT
 
@@ -23,9 +23,19 @@ CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_PATTERN = re.compile(r"^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$")
 TOKEN_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 INVITATION_SECONDS = 600
+# The first-device setup code appears only in the bridge log and expires; a restart issues a new one.
+SETUP_SECONDS = 3600
+# Throttling per client address: ten failures within ten minutes block that address for ten minutes.
 FAILURE_WINDOW = 600
 FAILURE_LIMIT = 10
 BLOCK_SECONDS = 600
+FAILURE_DELAY = 1.5
+# Bridge-wide budget: a failed check keeps its slot for FAILURE_DELAY, which bounds the guessing rate of many
+# addresses together; beyond MAX_WAITING queued checks, requests are refused without a check.
+PARALLEL_CHECKS = 4
+MAX_WAITING = 32
+BUSY_SECONDS = 10
+MAX_SOURCES = 4096
 MAX_INVITATIONS = 20
 
 
@@ -110,15 +120,32 @@ class PairingStore:
         self._sleep = sleep
         self.devices: list[ClientDevice] = []
         self.invitations: dict[str, Invitation] = {}
-        self._failures: deque[float] = deque()
-        self._blocked_until = 0.0
+        self._failures: dict[str | None, deque[float]] = {}
+        self._blocked_until: dict[str | None, float] = {}
         self._lock = asyncio.Lock()
+        self._checks = asyncio.Semaphore(PARALLEL_CHECKS)
+        self._waiting = 0
         self._active: dict[str, set[asyncio.Task]] = {}
         self._dirty_seen = False
         self._last_seen_save: dict[str, float] = {}
         self._load()
-        # A fixed access key suppresses the public first-time setup code.
-        self.setup_code = _new_code() if not self.devices and not legacy_secret else None
+        # A fixed access key suppresses the first-time setup code. Without one, the code is valid for
+        # SETUP_SECONDS after start and only while no device is paired; removing the last device does not reopen it.
+        self.setup_code: str | None = None
+        self.setup_expires_at = 0
+        if not self.devices and not legacy_secret:
+            self.setup_code = _new_code()
+            self.setup_expires_at = int(self._clock()) + SETUP_SECONDS
+
+    @property
+    def setup_open(self) -> bool:
+        """A setup code exists and has not expired."""
+        return bool(self.setup_code) and self._clock() < self.setup_expires_at
+
+    @property
+    def setup_remaining(self) -> int:
+        """Seconds the setup code stays valid, 0 without one."""
+        return max(0, int(self.setup_expires_at - self._clock())) if self.setup_open else 0
 
     def _load(self) -> None:
         try:
@@ -217,52 +244,116 @@ class PairingStore:
             if not tasks:
                 self._active.pop(principal.device_id, None)
 
-    async def pair(self, code_value: str, device_name: str) -> tuple[str, ClientDevice]:
+    async def pair(self, code_value: str, device_name: str, source: str | None = None) -> tuple[str, ClientDevice]:
+        """Pair with the setup code or an invitation. `source` identifies the client for throttling."""
         name = device_name.strip() if isinstance(device_name, str) else ""
         if not name or len(name) > 100:
             raise ValueError(m('device_name must be 1 to 100 characters long.'))
         code = normalize_code(code_value) if isinstance(code_value, str) else ""
-        now = self._clock()
-        async with self._lock:
-            if now < self._blocked_until:
-                raise RateLimited(int(self._blocked_until - now + 0.999))
+
+        def attempt(now: float) -> tuple[str, ClientDevice] | None:
             self._expire_invitations(int(now))
             invitation = self.invitations.get(code)
-            valid_setup = bool(code and self.setup_code and hmac.compare_digest(code, self.setup_code))
+            valid_setup = bool(code and self.setup_open and hmac.compare_digest(code, self.setup_code))
             valid_invitation = bool(invitation and hmac.compare_digest(code, invitation.code))
-            if valid_setup or valid_invitation:
-                token = secrets.token_urlsafe(32)
-                stamp = int(now)
-                device = ClientDevice(str(uuid.uuid4()), name, hashlib.sha256(token.encode()).hexdigest(), stamp, stamp)
-                previous_devices = list(self.devices)
-                previous_setup = self.setup_code
-                previous_invitations = dict(self.invitations)
-                self.devices.append(device)
-                if valid_setup:
-                    self.setup_code = None
-                else:
-                    self.invitations.pop(code, None)
-                try:
-                    self._save()
-                except AuthError:
-                    self.devices = previous_devices
-                    self.setup_code = previous_setup
-                    self.invitations = previous_invitations
-                    raise
-                self._last_seen_save[device.id] = now
-                return token, device
-            reached_limit = self._record_failure(now)
-        await self._sleep(1.5)
+            if not (valid_setup or valid_invitation):
+                return None
+            token = secrets.token_urlsafe(32)
+            stamp = int(now)
+            device = ClientDevice(str(uuid.uuid4()), name, hashlib.sha256(token.encode()).hexdigest(), stamp, stamp)
+            previous_devices = list(self.devices)
+            previous_setup = self.setup_code
+            previous_invitations = dict(self.invitations)
+            self.devices.append(device)
+            if valid_setup:
+                self.setup_code = None
+            else:
+                self.invitations.pop(code, None)
+            try:
+                self._save()
+            except AuthError:
+                self.devices = previous_devices
+                self.setup_code = previous_setup
+                self.invitations = previous_invitations
+                raise
+            self._last_seen_save[device.id] = now
+            return token, device
+
+        return await self._checked(source, attempt)
+
+    async def check_setup(self, code_value, source: str | None = None) -> str:
+        """Verify the setup code without using it up (setup page QR code); same throttling as pairing."""
+        code = normalize_code(code_value) if isinstance(code_value, str) else ""
+
+        def attempt(_now: float) -> str | None:
+            valid = bool(code and self.setup_open and hmac.compare_digest(code, self.setup_code))
+            return code if valid else None
+
+        return await self._checked(source, attempt)
+
+    async def check_access_key(self, key, source: str | None = None) -> None:
+        """Verify the fixed access key (`BRIDGE_ACCESS_TOKEN`); same throttling as codes."""
+        def attempt(_now: float) -> bool | None:
+            if not self.legacy_secret or not isinstance(key, str):
+                return None
+            try:
+                return True if hmac.compare_digest(key.strip().encode(), self.legacy_secret.encode()) else None
+            except UnicodeEncodeError:
+                return None
+
+        await self._checked(source, attempt)
+
+    def retry_after(self, source: str | None) -> int | None:
+        """Seconds until `source` may try again, or None if it is not blocked."""
+        now = self._clock()
+        until = self._blocked_until.get(source, 0.0)
+        return int(until - now + 0.999) if now < until else None
+
+    async def _checked(self, source: str | None, attempt: Callable[[float], Any]) -> Any:
+        """Run one credential check: a blocked source is refused, failures are counted per source and keep a
+        bridge-wide check slot for FAILURE_DELAY, so concurrent guesses cannot multiply the rate."""
+        blocked = self.retry_after(source)
+        if blocked is not None:
+            raise RateLimited(blocked)
+        if self._waiting >= MAX_WAITING:
+            raise RateLimited(BUSY_SECONDS)
+        self._waiting += 1
+        try:
+            async with self._checks:
+                async with self._lock:
+                    blocked = self.retry_after(source)
+                    if blocked is not None:
+                        raise RateLimited(blocked)
+                    now = self._clock()
+                    result = attempt(now)
+                    if result is not None:
+                        return result
+                    reached_limit = self._record_failure(source, now)
+                await self._sleep(FAILURE_DELAY)
+        finally:
+            self._waiting -= 1
         if reached_limit:
             raise RateLimited(BLOCK_SECONDS)
         raise InvalidCode()
 
-    def _record_failure(self, now: float) -> bool:
-        while self._failures and self._failures[0] <= now - FAILURE_WINDOW:
-            self._failures.popleft()
-        self._failures.append(now)
-        if len(self._failures) >= FAILURE_LIMIT:
-            self._blocked_until = now + BLOCK_SECONDS
+    def _record_failure(self, source: str | None, now: float) -> bool:
+        for key in [key for key, until in self._blocked_until.items() if until <= now]:
+            self._blocked_until.pop(key, None)
+        failures = self._failures.setdefault(source, deque())
+        while failures and failures[0] <= now - FAILURE_WINDOW:
+            failures.popleft()
+        failures.append(now)
+        if len(self._failures) > MAX_SOURCES:
+            # Bounded memory: forget the source with the oldest latest failure.
+            stale = [key for key, times in self._failures.items() if not times or times[-1] <= now - FAILURE_WINDOW]
+            for key in stale:
+                self._failures.pop(key, None)
+            if len(self._failures) > MAX_SOURCES:
+                oldest = min((key for key in self._failures if key != source), key=lambda k: self._failures[k][-1])
+                self._failures.pop(oldest, None)
+        if len(failures) >= FAILURE_LIMIT:
+            self._blocked_until[source] = now + BLOCK_SECONDS
+            failures.clear()
             return True
         return False
 
@@ -287,18 +378,14 @@ class PairingStore:
             if index is None:
                 return False
             previous_devices = list(self.devices)
-            previous_setup = self.setup_code
             previous_invitations = dict(self.invitations)
             self.devices.pop(index)
             self.invitations = {code: invitation for code, invitation in self.invitations.items()
                                 if invitation.creator_id != identifier}
-            if not self.devices and not self.legacy_secret:
-                self.setup_code = _new_code()
             try:
                 self._save()
             except AuthError:
                 self.devices = previous_devices
-                self.setup_code = previous_setup
                 self.invitations = previous_invitations
                 raise
         current = asyncio.current_task()

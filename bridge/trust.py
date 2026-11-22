@@ -97,6 +97,7 @@ class PrinterTrust:
         return context
 
     async def check(self, host: str, port: int = 8883, timeout: float = 8) -> None:
-        """Handshake only, without login, before clients such as ffmpeg that cannot verify pins themselves."""
+        """Handshake only, without login, before clients such as ffmpeg that cannot verify pins themselves.
+        Check the port that client will use: another device could answer there while MQTT reaches the printer."""
         _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=self.context()), timeout)
         writer.close()

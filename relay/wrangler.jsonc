@@ -1,6 +1,6 @@
 {
   // Relay for Live Activities and notifications (see README). Secrets: APNS_KEY (.p8 file contents), APNS_TEAM_ID,
-  // RELAY_SECRET.
+  // RELAY_SECRET, and RELAY_SECRET_PREVIOUS only while rotating it.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "bambu-push-relay",
   "main": "src/index.ts",
@@ -18,7 +18,7 @@
     { "name": "SENDER_LIMIT", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } },
     { "name": "REGISTER_LIMIT", "namespace_id": "1003", "simple": { "limit": 5, "period": 60 } }
   ],
-  // Token hash → bridge ID (src/bridges.ts), seven days.
+  // Token hash → bridge ID (src/bridges.ts), seven days; hashes of delivered notification IDs, one day.
   "kv_namespaces": [{ "binding": "TOKENS", "id": "cfce3807691e421898a5946ebf2f7ba8" }],
   // No logs: job names and progress must not be retained.
   "observability": { "enabled": false }

@@ -22,10 +22,26 @@ class ConfigAndIdentityTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             Config.from_env({"BAMBU_PRINT_URL": "ftp:///fest"})
         config = Config.from_env({"BAMBU_PRINT_URL": "ftp:///{name}", "BRIDGE_TLS": "off",
-                                  "BRIDGE_MDNS": "off"})
+                                  "BRIDGE_TRUSTED_PROXIES": "10.42.0.0/16", "BRIDGE_MDNS": "off"})
         self.assertEqual(config.print_url, "ftp:///{name}")
         self.assertFalse(config.tls)
         self.assertFalse(config.mdns)
+        self.assertFalse(config.plain_http)
+
+    def test_tls_off_needs_trusted_proxies_or_explicit_plain_http(self):
+        with self.assertRaises(ConfigError) as refused:
+            Config.from_env({"BRIDGE_TLS": "off", "BRIDGE_PUBLIC_URL": "https://orcbro.example.com"})
+        self.assertIn("BRIDGE_TRUSTED_PROXIES", str(refused.exception))
+        with self.assertRaises(ConfigError):
+            Config.from_env({"BRIDGE_TLS": "off", "BRIDGE_PLAIN_HTTP": "yes"})
+        self.assertTrue(Config.from_env({"BRIDGE_TLS": "off", "BRIDGE_PLAIN_HTTP": "on"}).plain_http)
+        # The owner's deployment: TLS behind Traefik with a fixed key and serial number.
+        config = Config.from_env({"BRIDGE_TLS": "off", "BRIDGE_TRUSTED_PROXIES": "10.42.0.0/16",
+                                  "BRIDGE_PUBLIC_URL": "https://orcbro.example.com",
+                                  "BRIDGE_ACCESS_TOKEN": "s3cret-bridge-access-token", "BAMBU_HOST": "192.0.2.10",
+                                  "BAMBU_ACCESS_CODE": "12345678", "BAMBU_SERIAL": "01p00a000000000"})
+        self.assertEqual((config.trusted_proxies, config.serial), (("10.42.0.0/16",), "01P00A000000000"))
+        self.assertTrue(Config.from_env({}).tls)
 
     def test_identity_is_reused_and_override_is_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,12 +113,29 @@ class WebTests(unittest.TestCase):
         self.assertIn("code=ABCD-EFGH", url)
         self.assertIn("fp=" + "ab" * 32, url)
 
-    def test_page_escapes_printers_and_fixed_key_never_shows_code(self):
+    def test_page_escapes_name_and_fixed_key_never_shows_code(self):
         identity = BridgeIdentity("id", "<Bridge>")
-        page = setup_page(identity=identity, printers=[{"name": "<Drucker>", "model": "P&S", "connected": True}],
-                          setup_code="ABCDEFGH", origin=PublicOrigin("https://bridge", True),
-                          fingerprint="ab" * 32, fixed_key=True)
-        self.assertNotIn("ABCD-EFGH", page)
-        self.assertNotIn("<Drucker>", page)
-        self.assertIn("&lt;Drucker&gt;", page)
+        page = setup_page(identity=identity, origin=PublicOrigin("https://bridge", True), fixed_key=True,
+                          paired=False, setup_minutes=None)
+        self.assertNotIn("<Bridge>", page)
+        self.assertIn("&lt;Bridge&gt;", page)
         self.assertIn('fixed access key', page)
+
+    def test_setup_page_states(self):
+        identity = BridgeIdentity("id", "Bridge")
+        origin = PublicOrigin("https://bridge.local:8443", True)
+        plain = setup_page(identity=identity, origin=origin, fixed_key=False, paired=False, setup_minutes=42)
+        self.assertIn("bridge log", plain)
+        self.assertIn("42 more minutes", plain)
+        self.assertIn('href="https://bridge.local:8443/"', plain)
+        self.assertNotIn("<form", plain)
+        self.assertNotIn("fp=", plain)
+        secure = setup_page(identity=identity, origin=origin, fixed_key=False, paired=False, setup_minutes=42,
+                            secure=True)
+        self.assertIn('action="/setup"', secure)
+        self.assertNotIn("<svg", secure)
+        closed = setup_page(identity=identity, origin=origin, fixed_key=False, paired=False, setup_minutes=None)
+        self.assertIn("Restart the bridge", closed)
+        self.assertNotIn("<form", closed)
+        paired = setup_page(identity=identity, origin=origin, fixed_key=False, paired=True, setup_minutes=None)
+        self.assertIn("Pair Another Device", paired)

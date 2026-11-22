@@ -3,7 +3,9 @@
 The first push registers the bridge (`POST /v1/bridges`) and stores its ID/key in private
 `relay.json`. The first bridge to use a push token owns it at the relay. Live Activities omit
 `alert`; notifications send template values (notify.py). Both include the token's language.
-A relay 410 invalidates the token, as APNs does."""
+A relay 410 invalidates the token, as APNs does. While the relay rotates its secret, it answers
+with the bridge's new key (`x-bridge-key`); the bridge stores it and keeps its ID, so its tokens
+stay bound to it."""
 from __future__ import annotations
 
 from .i18n import m
@@ -12,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import httpx
@@ -20,6 +23,8 @@ from . import __version__
 from .apns import APNsError
 
 log = logging.getLogger(__name__)
+
+KEY = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
 class RelayClient:
@@ -41,12 +46,15 @@ class RelayClient:
 
     async def _post(self, path: str, body: dict) -> None:
         for attempt in range(2):
-            headers = {"authorization": f"Bearer {await self._authorization()}"}
-            response = await self._client.post(f"{self.url}{path}", json=body, headers=headers)
+            used = await self._authorization()
+            response = await self._client.post(f"{self.url}{path}", json=body, headers={"authorization": f"Bearer {used}"})
             if response.status_code == 401 and attempt == 0:
                 # Incorrect key (changed relay secret or another installation's file): register again.
                 await self._forget()
                 continue
+            renewed = response.headers.get("x-bridge-key")
+            if renewed and KEY.fullmatch(renewed):
+                await self._renew(used, renewed)
             break
         if response.status_code == 200:
             return
@@ -80,13 +88,29 @@ class RelayClient:
             raise APNsError(response.status_code, m('Relay registration failed'))
         data = response.json()
         log.info(m('Registered with relay %s'), self.url)
+        self._save(data["bridge"], data["key"])
+        return f"{data['bridge']}.{data['key']}"
+
+    def _save(self, bridge: str, key: str) -> None:
         if self.credentials:
             tmp = self.credentials.with_suffix(".tmp")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"url": self.url, "bridge": data["bridge"], "key": data["key"]}, handle)
+                json.dump({"url": self.url, "bridge": bridge, "key": key}, handle)
             tmp.replace(self.credentials)
-        return f"{data['bridge']}.{data['key']}"
+
+    async def _renew(self, used: str, key: str) -> None:
+        """The relay changed its secret and sent this bridge's new key: same ID, so its tokens stay bound to it."""
+        async with self._lock:
+            if self._auth != used:
+                return
+            bridge = used.split(".", 1)[0]
+            self._auth = f"{bridge}.{key}"
+            try:
+                self._save(bridge, key)
+            except OSError as exc:
+                log.warning(m('Could not save the new relay key: %s'), exc)
+            log.info(m("Relay %s renewed this bridge's key"), self.url)
 
     async def _forget(self) -> None:
         async with self._lock:

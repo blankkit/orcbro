@@ -76,6 +76,21 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(self.credentials.read_text())["bridge"], "b" * 32)
         await client.close()
 
+    async def test_key_from_a_rotated_relay_secret_is_kept_with_the_same_id(self):
+        self.credentials.write_text(json.dumps({"url": "https://relay.example", "bridge": "a" * 32, "key": "o" * 43}))
+        seen = []
+        replies = iter([httpx.Response(200, json={"ok": True}, headers={"x-bridge-key": "n" * 43}),
+                        httpx.Response(200, json={"ok": True}, headers={"x-bridge-key": "not a key"})])
+        client = self.client(replies, seen)
+        await client.send_notification("ab" * 32, "development", {"template": "finished", "job": "x", "printer": "y"})
+        await client.send_notification("ab" * 32, "development", {"template": "finished", "job": "x", "printer": "y"})
+        self.assertEqual([r.url.path for r in seen], ["/v1/notification", "/v1/notification"])
+        self.assertEqual(seen[1].headers["authorization"], f"Bearer {'a' * 32}.{'n' * 43}")
+        self.assertEqual(json.loads(self.credentials.read_text()), {"url": "https://relay.example", "bridge": "a" * 32,
+                                                                    "key": "n" * 43})
+        self.assertEqual(stat.S_IMODE(self.credentials.stat().st_mode), 0o600)
+        await client.close()
+
     async def test_explicit_german_language_is_forwarded(self):
         seen = []
         replies = iter([httpx.Response(200, json={"ok": True}), httpx.Response(200, json={"ok": True})])

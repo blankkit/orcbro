@@ -15,10 +15,10 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from bridge.apns import APNsClient, APNsConfig, APNsError
 from bridge.auth import Principal
 from bridge.config import Config
-from bridge.live import ATTRIBUTES_TYPE, LiveActivities, Registry, content_state
+from bridge.live import ATTRIBUTES_TYPE, DISMISS_AFTER, SHARED_DEVICE, LiveActivities, Registry, content_state
 from bridge.printer import Printer
 from bridge.server import app_token, create_app
-from helpers import FILAMENT_IDS, PROFILES, load
+from helpers import FILAMENT_IDS, MODELS, PROFILES, load
 
 
 def status(state="RUNNING", progress=10, layer=3, name="Deckel", stage=None, print_error=0, hms=(), connected=True):
@@ -36,10 +36,13 @@ class FakeAPNs:
         self.sent: list[tuple[str, str, dict, int]] = []
         self.notes: list[tuple[str, str, dict]] = []
         self.gone: set[str] = set()
+        self.down = False  # Network or relay failure.
 
     async def send_live_activity(self, token, environment, payload, priority=5):
         if token in self.gone:
             raise APNsError(410, "Unregistered")
+        if self.down:
+            raise httpx.ConnectError("relay unreachable")
         self.sent.append((token, environment, payload, priority))
 
     async def send_notification(self, token, environment, item):
@@ -163,26 +166,82 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
         await again.process(status(state="RUNNING"), now=1100)
         self.assertEqual([e for e, _ in self.apns.events()].count("start"), 1)
 
-    async def test_disconnected_printer_changes_nothing(self):
+    async def test_disconnected_printer_keeps_a_running_print(self):
         await self.live.process(status(state="RUNNING"), now=1000)
         await self.live.process(status(state="IDLE", connected=False), now=1100)
         self.assertIsNotNone(self.live.push.current)
+        self.assertNotIn("ended", self.live.push.current)
 
-    async def test_printers_are_separate_and_old_file_is_adopted(self):
-        # Adopt old single-printer push.json current print and tokens into the default printer.
+    async def test_finished_activity_ends_while_the_printer_is_off(self):
+        """Printers are often switched off after a print; the finished activity still goes after an hour."""
+        await self.live.process(status(state="RUNNING"), now=1000)
+        self.registry.add("update", "bb" * 32, "development", "act-1")
+        await self.live.process(status(state="FINISH", progress=100), now=2000)
+        for now in range(2060, 2000 + 6 * 3600, 60):  # The run loop feeds the last status back every minute.
+            await self.live.process(status(state="FINISH", progress=100, connected=False), now=now)
+        self.assertEqual(self.apns.events("bb" * 32), [("update", 10), ("end", 10)])
+        end = self.apns.sent[-1][2]["aps"]
+        self.assertEqual(end["content-state"]["phase"], "FINISH")
+        self.assertLessEqual(end["dismissal-date"], 2000 + DISMISS_AFTER + 60)
+        self.assertIsNone(self.live.push.current)
+        self.assertIsNone(Registry(self.path).section("").current)
+
+    async def test_finished_activity_ends_after_a_restart_without_printer(self):
+        """After a restart the printer may never connect: the loop runs without a status."""
+        await self.live.process(status(state="RUNNING"), now=1000)
+        self.registry.add("update", "bb" * 32, "development", "act-1")
+        await self.live.process(status(state="FINISH", progress=100), now=2000)
+        again = LiveActivities(self.apns, Registry(self.path), lambda: "Werkstatt")
+        await again.process(None, now=2100)
+        self.assertEqual(self.apns.events("bb" * 32), [("update", 10)])
+        await again.process(None, now=2000 + DISMISS_AFTER)
+        self.assertEqual(self.apns.events("bb" * 32), [("update", 10), ("end", 10)])
+
+    async def test_failed_final_update_is_sent_again(self):
+        await self.live.process(status(state="RUNNING", progress=98), now=1000)
+        self.registry.add("update", "bb" * 32, "development", "act-1")
+        self.registry.add("update", "cc" * 32, "development", "act-2")
+        self.apns.gone.add("cc" * 32)
+        self.apns.down = True
+        await self.live.process(status(state="FINISH", progress=100), now=2000)
+        self.assertEqual(self.live.push.current["retry"], ["bb" * 32])  # Not the token APNs rejected for good.
+        self.apns.down = False
+        await self.live.process(status(state="FINISH", progress=100, connected=False), now=2030)
+        self.assertEqual(self.apns.events("bb" * 32), [])  # At most once a minute.
+        await self.live.process(status(state="FINISH", progress=100, connected=False), now=2060)
+        self.assertEqual(self.apns.events("bb" * 32), [("update", 10)])
+        self.assertEqual(self.apns.sent[-1][2]["aps"]["content-state"]["phase"], "FINISH")
+        self.assertNotIn("retry", self.live.push.current)
+        await self.live.process(status(state="FINISH", progress=100, connected=False), now=2200)
+        self.assertEqual(len(self.apns.events("bb" * 32)), 1)
+
+    async def test_removed_printer_ends_its_activity_now(self):
+        live = LiveActivities(self.apns, self.registry, lambda: "Keller", "01P0002")
+        await live.process(status(state="RUNNING", progress=40), now=1000)
+        self.registry.add("update", "bb" * 32, "development", "act-1", "01P0002")
+        await live.process(status(state="RUNNING", progress=41), now=1100)
+        await live.retire(now=1200)
+        self.assertEqual(self.apns.events("bb" * 32)[-1], ("end", 10))
+        aps = self.apns.sent[-1][2]["aps"]
+        self.assertEqual((aps["dismissal-date"], aps["content-state"]["progress"]), (1200, 41))
+        self.assertNotIn("01P0002", Registry(self.path).printers)
+        self.assertIn("aa" * 32, Registry(self.path).start)  # Start tokens cover all printers.
+
+    async def test_printers_are_separate(self):
+        # A 0.x single-printer file (top-level current print and update tokens) is no longer adopted.
         self.path.write_text('{"start": {}, "current": {"key": "Deckel|", "started": 1}, '
                              '"activities": {"%s": {"environment": "development"}}}' % ("cc" * 32))
         registry = Registry(self.path)
-        first = LiveActivities(self.apns, registry, lambda: "Eins", "01P0001", adopt=True)
-        second = LiveActivities(self.apns, registry, lambda: "Zwei", "01P0002", adopt=False)
-        self.assertEqual(first.push.current["key"], "Deckel|")
-        self.assertIsNone(second.push.current)
+        first = LiveActivities(self.apns, registry, lambda: "Eins", "01P0001")
+        second = LiveActivities(self.apns, registry, lambda: "Zwei", "01P0002")
+        self.assertIsNone(first.push.current)
         registry.add("update", "dd" * 32, "development", "act-2", "01P0002")
         self.assertIn("dd" * 32, second.push.activities)
         self.assertNotIn("dd" * 32, first.push.activities)
         registry.save()
-        again = Registry(self.path)
-        self.assertEqual(set(again.printers), {"01P0001", "01P0002"})
+        again = json.loads(self.path.read_text())
+        self.assertEqual(set(again["printers"]), {"01P0001", "01P0002"})
+        self.assertNotIn("current", again)
 
     async def test_gone_tokens_are_forgotten(self):
         self.apns.gone.add("aa" * 32)
@@ -248,7 +307,7 @@ class LiveEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         config = Config(host="192.0.2.10", serial="01P00A000000000", access_code="12345678",
                         bridge_token="s3cret-bridge-access-token", data_dir=Path(self.tmp.name), profiles_dir=PROFILES,
-                        filament_ids=FILAMENT_IDS, orca_cmd=(sys.executable, "-c", "pass"))
+                        filament_ids=FILAMENT_IDS, models_dir=MODELS, orca_cmd=(sys.executable, "-c", "pass"))
         printer = Printer(config.host, config.serial, config.access_code, "Test")
         printer.handle(load("pushall_p1s.json"))
         printer.connected = True
@@ -291,6 +350,46 @@ class LiveEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cd" * 32, self.live.registry.start)
         self.assertIn("ef" * 32, self.live.registry.start)
 
+    async def test_another_device_cannot_register_a_known_token(self):
+        from bridge.server import AUTH
+        app = self.client.server.app
+        token, device = await app[AUTH].pair((await app[AUTH].invite(Principal("access_key"))).code, "iPhone")
+        own = {"Authorization": f"Bearer {token}"}
+        body = {"kind": "start", "token": "cd" * 32, "environment": "production", "installation": "ABCDEF01"}
+        self.assertEqual((await self.client.post("/api/live/register", json=body, headers=own)).status, 200)
+        # Another installation (the same one may take its token to a new pairing).
+        taken = await self.client.post("/api/live/register", json={**body, "installation": "ABCDEF02"},
+                                       headers={**self.auth, "Accept-Language": "de"})
+        self.assertEqual(taken.status, 409)
+        self.assertEqual((await taken.json())["error"], "Dieses Push-Token ist von einem anderen gekoppelten Gerät registriert.")
+        self.assertEqual(self.live.registry.start["cd" * 32]["device"], device.id)
+
+    async def test_unregister_installation(self):
+        from bridge.server import AUTH
+        app = self.client.server.app
+        token, device = await app[AUTH].pair((await app[AUTH].invite(Principal("access_key"))).code, "iPhone")
+        own = {"Authorization": f"Bearer {token}"}
+        post = lambda body, headers: self.client.post("/api/live/register", json=body, headers=headers)
+        installation = "6F9619FF-8B86-D011-B42D-00CF4FC964FF"
+        for kind, value in (("start", "a1"), ("alert", "a2"), ("update", "a3")):
+            body = {"kind": kind, "token": value * 32, "environment": "production", "installation": installation.lower(),
+                    "events": ["finished"], "activity_id": "act"}
+            self.assertEqual((await post(body, self.auth)).status, 200)
+        await post({"kind": "start", "token": "b1" * 32, "environment": "production", "installation": "22222222-0000"},
+                   self.auth)
+        await post({"kind": "start", "token": "c1" * 32, "environment": "production", "installation": installation}, own)
+        delete = lambda query, headers=self.auth: self.client.delete(f"/api/live/register{query}", headers=headers)
+        reply = await delete(f"?installation={installation.lower()}")
+        self.assertEqual((reply.status, await reply.json()), (200, {"removed": 3}))
+        self.assertEqual(set(self.live.registry.start), {"b1" * 32, "c1" * 32})
+        self.assertEqual(self.live.registry.alerts, {})
+        self.assertEqual(await (await delete(f"?installation={installation}")).json(), {"removed": 0})
+        self.assertEqual(await (await delete(f"?installation={installation}", own)).json(), {"removed": 1})
+        self.assertEqual(set(self.live.registry.start), {"b1" * 32})
+        self.assertEqual((await delete("")).status, 422)
+        self.assertEqual((await delete("?installation=nope!")).status, 422)
+        self.assertEqual((await delete(f"?installation={installation}", {})).status, 401)
+
     async def test_update_token_with_public_printer_id(self):
         from bridge.live import public_printer_id
         body = {"kind": "update", "token": "12" * 32, "environment": "production", "activity_id": "a1",
@@ -307,9 +406,12 @@ class RegistrySecurityTests(unittest.TestCase):
                                         "printers": {"S1": {"activities": {"bb" * 32: {"environment": "production"}}}}}))
             os.chmod(path, 0o644)
             registry = Registry(path)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            # Registrations from before device binding are never delivered, and startup discards them.
+            self.assertIsNone(registry.owner("start", "aa" * 32))
+            self.assertEqual(registry.bind(lambda _device: True, None), 2)
             self.assertEqual(registry.start, {})
             self.assertEqual(registry.section("S1").activities, {})
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             registry.add("start", "cc" * 32, "production", device="d1")
             registry.add("update", "dd" * 32, "production", "a", "S1", device="d2")
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -321,6 +423,112 @@ class RegistrySecurityTests(unittest.TestCase):
         self.assertNotIn("01P00A000000000", public_printer_id("01P00A000000000"))
         self.assertEqual(public_printer_id("01P00A000000000"), public_printer_id("01P00A000000000"))
         self.assertEqual(len(public_printer_id("01P00A000000000")), 17)
+
+
+class OwnershipTests(unittest.IsolatedAsyncioTestCase):
+    """Registrations belong to the paired device (or the shared access key) that made them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "push.json"
+        self.registry = Registry(self.path)
+        self.paired = {"d1", "d2"}
+        self.registry.bind(lambda device: device in self.paired, "fixed-key")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_another_device_cannot_take_over_or_replace_a_registration(self):
+        self.assertTrue(self.registry.add("start", "aa" * 32, "production", device="d1", installation="INST-1"))
+        self.assertTrue(self.registry.add("alert", "a1" * 32, "production", device="d1", installation="INST-1",
+                                          events=["finished"]))
+        # Same token, other identity: refused, the registration stays with d1.
+        self.assertFalse(self.registry.add("start", "aa" * 32, "production", device="d2"))
+        self.assertFalse(self.registry.add("alert", "a1" * 32, "production", events=[]))  # Shared key.
+        self.assertEqual((self.registry.start["aa" * 32]["device"], self.registry.alerts["a1" * 32]["events"]),
+                         ("d1", ["finished"]))
+        # Same installation ID from another identity does not replace d1's tokens.
+        self.assertTrue(self.registry.add("start", "bb" * 32, "production", device="d2", installation="INST-1"))
+        self.assertTrue(self.registry.add("alert", "a2" * 32, "production", installation="INST-1", events=["failed"]))
+        self.assertEqual(set(self.registry.start), {"aa" * 32, "bb" * 32})
+        self.assertEqual(set(self.registry.alerts), {"a1" * 32, "a2" * 32})
+        # Rotation within the identity still replaces the old token.
+        self.assertTrue(self.registry.add("start", "cc" * 32, "production", device="d1", installation="INST-1"))
+        self.assertEqual(set(self.registry.start), {"bb" * 32, "cc" * 32})
+        # Once d1 is revoked, its token may move.
+        self.paired.discard("d1")
+        self.assertTrue(self.registry.add("alert", "a1" * 32, "production", device="d2", events=["paused"]))
+        self.assertEqual(self.registry.alerts["a1" * 32]["device"], "d2")
+
+    def test_the_same_installation_takes_its_tokens_to_a_new_pairing(self):
+        # The iPhone paired again (new device ID) while its old pairing still exists: its own tokens move along.
+        self.assertTrue(self.registry.add("start", "aa" * 32, "production", device="d1", installation="INST-1"))
+        self.assertTrue(self.registry.add("alert", "a1" * 32, "production", device="d1", installation="INST-1",
+                                          events=["finished"]))
+        self.assertTrue(self.registry.add("start", "aa" * 32, "production", device="d2", installation="INST-1"))
+        self.assertTrue(self.registry.add("alert", "a1" * 32, "production", device="d2", installation="INST-1",
+                                          events=["failed"]))
+        self.assertEqual((self.registry.start["aa" * 32]["device"], self.registry.alerts["a1" * 32]["device"]),
+                         ("d2", "d2"))
+        self.assertEqual(self.registry.alerts["a1" * 32]["events"], ["failed"])
+        # Another installation still cannot take them.
+        self.assertFalse(self.registry.add("start", "aa" * 32, "production", device="d1", installation="INST-2"))
+
+    def test_installation_removes_only_its_own_registrations(self):
+        self.registry.add("start", "aa" * 32, "production", installation="INST-1")
+        self.registry.add("alert", "a1" * 32, "production", installation="INST-1", events=["finished"])
+        self.registry.add("update", "u1" * 32, "production", "act-1", "P1", installation="INST-1")
+        self.registry.add("start", "bb" * 32, "production", installation="INST-2")
+        self.registry.add("start", "cc" * 32, "production", device="d1", installation="INST-1")
+        self.registry.add("update", "u2" * 32, "production", "act-2", "P1", device="d1")  # Older app: no installation.
+        self.assertEqual(self.registry.remove_installation(SHARED_DEVICE, "INST-1"), 3)
+        self.assertEqual(set(self.registry.start), {"bb" * 32, "cc" * 32})
+        self.assertEqual(self.registry.alerts, {})
+        self.assertEqual(self.registry.remove_installation("d2", "INST-1"), 0)
+        self.assertEqual(self.registry.remove_installation("d1", "INST-1"), 2)
+        self.assertEqual(list(Registry(self.path).start), ["bb" * 32])
+        self.assertEqual(Registry(self.path).section("P1").activities, {})
+
+    def test_startup_discards_revoked_devices_and_an_old_shared_key(self):
+        self.registry.add("start", "aa" * 32, "production", device="d1")
+        self.registry.add("start", "bb" * 32, "production", device="d2")
+        self.registry.add("alert", "a1" * 32, "production", installation="INST-1", events=["finished"])
+        # Revoked while the push registry could not be saved: discarded at the next start.
+        restarted = Registry(self.path)
+        self.assertEqual(restarted.bind(lambda device: device == "d2", "fixed-key"), 1)
+        self.assertEqual(set(restarted.start), {"bb" * 32})
+        self.assertEqual(set(restarted.alerts), {"a1" * 32})  # Same key: shared registrations stay.
+        self.assertNotIn("fixed-key", self.path.read_text())
+        rotated = Registry(self.path)
+        self.assertEqual(rotated.bind(lambda device: True, "new-key"), 1)
+        self.assertEqual(rotated.alerts, {})
+        rotated.add("alert", "a2" * 32, "production", installation="INST-1", events=["finished"])
+        without = Registry(self.path)
+        self.assertEqual(without.bind(lambda device: True, None), 1)  # No fixed key any more.
+        self.assertIsNone(Registry(self.path).shared_key)
+
+    def test_registrations_from_before_the_key_check_are_adopted(self):
+        self.path.write_text(json.dumps({"alerts": {"a1" * 32: {"environment": "production", "device": SHARED_DEVICE,
+                                                                 "events": ["finished"]}}}))
+        registry = Registry(self.path)
+        self.assertEqual(registry.bind(lambda device: True, "fixed-key"), 0)
+        self.assertIn("a1" * 32, Registry(self.path).alerts)
+        again = Registry(self.path)
+        self.assertEqual(again.bind(lambda device: True, "fixed-key"), 0)
+        self.assertEqual(again.shared_key, registry.shared_key)
+
+    async def test_revoked_device_gets_nothing_before_the_registry_is_saved(self):
+        apns = FakeAPNs()
+        self.registry.add("start", "aa" * 32, "production", device="d1")
+        self.registry.add("start", "bb" * 32, "production", device="d2")
+        self.registry.add("alert", "a1" * 32, "production", device="d1", events=["finished"])
+        live = LiveActivities(apns, self.registry, lambda: "Werkstatt")
+        self.paired.discard("d1")
+        await live.process(status(state="RUNNING"), now=1000)
+        await live.process(status(state="FINISH"), now=1100)
+        self.assertEqual([token for token, *_ in apns.sent], ["bb" * 32])
+        self.assertEqual(apns.notes, [])
+        self.assertEqual(set(Registry(self.path).start), {"bb" * 32})
 
 
 class StartTokenTests(unittest.TestCase):

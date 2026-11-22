@@ -16,7 +16,6 @@ from .i18n import m
 import json
 import logging
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -71,12 +70,6 @@ class ProfileError(Exception):
     """Missing or incompatible profile; return the readable message to the app."""
 
 
-@dataclass(frozen=True)
-class Choice:
-    name: str
-    label: str
-
-
 class Catalog:
     def __init__(self, root: Path, machine: str, filament_ids: Path | None = None):
         self.root = Path(root)
@@ -90,8 +83,9 @@ class Catalog:
             # Vendors such as SUNLU and Polymaker have subdirectories (filament/SUNLU/…).
             for name, data in _load_folder(self.root / kind).items():
                 self._raw[(kind, name)] = data
-        if ("machine", machine) not in self._raw:
-            raise ProfileError(m('Printer profile “{p0}” is missing at {p1}.', p0=machine, p1=self.root))
+            # Check the printer before reading the much larger process and filament folders.
+            if kind == "machine" and ("machine", machine) not in self._raw:
+                raise ProfileError(m('Printer profile “{p0}” is missing at {p1}.', p0=machine, p1=self.root))
         # AMS Bambu ID (e.g. GFA00) → OrcaSlicer ID (e.g. OFoiVqVM).
         self.bambu_to_orca: dict[str, str] = {}
         if filament_ids and filament_ids.exists():
@@ -311,6 +305,11 @@ class Catalog:
         if found:
             return found
         raise ProfileError(m('No filament profile found for {p0} ({p1}).', p0=material or m('unknown material'), p1=info_idx or m('no ID')))
+
+    def generic_for(self, material: str | None) -> str | None:
+        """Generic profile of a material for this printer (Generic PETG), else its most general profile; None for an
+        unknown material."""
+        return self._generic(material, self._bambu_filaments)
 
     def _generic(self, material: str | None, names: list[str]) -> str | None:
         """Bambu Generic profile for a material, otherwise its most general profile."""

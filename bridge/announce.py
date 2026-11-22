@@ -42,8 +42,9 @@ def settings(env: dict[str, str]) -> tuple[Announced, str, int]:
 async def run(env: dict[str, str]) -> None:
     identity, url, port = settings(env)
     advertiser = MDNSAdvertiser(identity=identity, port=port, fingerprint=None, tls_enabled=False, public_url=url)
-    await advertiser.start()
-    log.info(m('Announcing %s: %s'), identity.name, url)
+    # Without a local address yet, the advertiser keeps trying and logs the announcement once it succeeds.
+    if await advertiser.start():
+        log.info(m('Announcing %s: %s'), identity.name, url)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
     for caught in (signal.SIGINT, signal.SIGTERM):

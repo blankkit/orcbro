@@ -10,9 +10,11 @@ import re
 import time
 from typing import Any
 
+from . import recovery
 from .models import DUAL_NOZZLE_MODELS, CHAMBER_SENSOR_MODELS
 
-# mc_print_stage/stg_cur → readable stage. Protocol values with our own text.
+# mc_print_stage/stg_cur → readable stage. Protocol values with our own text; codes 0–77 follow Bambu Studio's
+# `get_stage_string`.
 STAGES: dict[int, str] = {
     0: m('Printing'),
     1: m('Auto bed leveling'),
@@ -50,18 +52,53 @@ STAGES: dict[int, str] = {
     33: m('Paused: Cutter error'),
     34: m('Paused: First layer error'),
     35: m('Paused: Nozzle clogged'),
+    36: m('Measuring motion precision'),
+    37: m('Enhancing motion precision'),
+    38: m('Measuring motion accuracy'),
+    39: m('Calibrating the nozzle offset'),
     40: m('High-temperature bed leveling'),
+    41: m('Checking the quick-release lever'),
+    42: m('Checking the door and top cover'),
+    43: m('Calibrating the laser'),
+    44: m('Checking the platform'),
+    45: m('Checking the BirdsEye camera position'),
+    46: m('Calibrating the BirdsEye camera'),
     47: m('Bed leveling, phase 1'),
     48: m('Bed leveling, phase 2'),
-    50: m('Cooling the bed'),
+    49: m('Heating the chamber'),
+    50: m('Adjusting the bed temperature'),
+    51: m('Printing calibration lines'),
+    52: m('Checking the material'),
+    53: m('Calibrating the live view camera'),
     54: m('Waiting for the bed temperature'),
+    55: m('Checking the material position'),
+    56: m('Calibrating the cutting module offset'),
+    57: m('Measuring the surface'),
+    58: m('Thermal preconditioning for the first layer'),
+    59: m('Homing the blade holder'),
+    60: m('Calibrating the camera offset'),
+    61: m('Calibrating the blade holder position'),
+    62: m('Testing hotend pick and place'),
+    63: m('Waiting for the chamber temperature to even out'),
+    64: m('Preparing the hotend'),
+    65: m('Calibrating nozzle clump detection'),
+    66: m('Purifying the chamber air'),
+    67: m('Measuring the rotary attachment'),
+    68: m('Moving the toolhead over the purge chute'),
+    69: m('Cooling the nozzle'),
+    70: m('Moving the toolhead to the bed center'),
+    71: m('Active arc fitting'),
+    72: m('Detecting the hotend type'),
+    73: m('Detecting the build plate alignment'),
+    74: m('Checking the bed surface for foreign objects'),
+    75: m('Checking under the bed for foreign objects'),
+    76: m('Pre-extruding before printing'),
+    77: m('Preparing the AMS'),
 }
 
 # Calibration started like Bambu Studio (`print.calibration`, `option` bitmask), running the printer's
 # auto_cali_for_user.gcode file.
 CALIBRATION_FILE = "auto_cali_for_user"
-
-GCODE_STATES = {"IDLE", "PREPARE", "RUNNING", "PAUSE", "FINISH", "FAILED", "SLICING", "INIT", "OFFLINE"}
 
 SPEED_LEVELS = {1: m('Silent'), 2: "Standard", 3: "Sport", 4: "Turbo"}
 
@@ -77,26 +114,28 @@ FLAG3_SIGNATURE_REQUIRED = 0x10
 HMS_COMMAND_REJECTED = "0500_0500_0001_0007"
 
 
-def merge(base: dict, update: dict) -> dict:
+def merge(base: dict, update: dict, *, full: bool = False) -> dict:
     """Recursively merge `update` into `base` in place and return `base`.
 
     Merge object lists by `id` (AMS units/slots), because printers send changed entries only.
-    All other lists replace the previous value. A bare AMS slot (`{"id"}`, at most with `state`) means the slot was
-    emptied or holds a spool without known filament: it replaces the old entry, so the previous spool's fields do
-    not linger (the P1 series reports a removed spool this way)."""
+    All other lists replace the previous value. A bare AMS slot or external spool (`tray` or `vir_slot` entry with
+    `id`, at most with `state`) means the slot was emptied or holds a spool without known filament: it replaces the
+    old entry, so the previous spool's fields do not linger (the P1 series reports a removed spool this way). A `full` report lists every AMS unit: a unit
+    missing from it was removed."""
     for key, value in update.items():
         old = base.get(key)
         if isinstance(value, dict) and isinstance(old, dict):
-            merge(old, value)
+            merge(old, value, full=full)
         elif _is_id_list(value) and _is_id_list(old):
             by_id = {str(item.get("id")): item for item in old}
             merged = []
             for item in value:
                 prior = by_id.pop(str(item.get("id")), None)
-                bare = key == "tray" and set(item) <= {"id", "state"}
+                bare = key in ("tray", "vir_slot") and set(item) <= {"id", "state"}
                 merged.append(merge(prior, item) if prior is not None and not bare else item)
             # Preserve entries missing from a partial update, appending them in their previous order.
-            merged.extend(by_id.values())
+            if not (full and key == "ams"):
+                merged.extend(by_id.values())
             merged.sort(key=lambda item: _sort_id(item.get("id")))
             base[key] = merged
         else:
@@ -212,13 +251,17 @@ def developer_mode(p: dict, hms: list[dict]) -> bool | None:
     return None
 
 
-def print_error(p: dict) -> dict | None:
-    """Numeric `print_error` → Bambu Studio code (`0300_400C`); 0 means no message."""
+def print_error(p: dict, model_id: str | None = None, state: str = "UNKNOWN") -> dict | None:
+    """Numeric `print_error` → Bambu Studio code (`0300_400C`); 0 means no message.
+
+    `actions` lists the recovery actions Bambu Studio's error dialog offers for the message (recovery.py);
+    `acknowledge` says whether acknowledging it (`clear_error`) is offered as well."""
     value = _int(p.get("print_error"), 0) or 0
     if value <= 0:
         return None
     raw = f"{value:08X}"
-    return {"code": f"{raw[:4]}_{raw[4:]}", "value": value}
+    actions, acknowledge = recovery.available(value, model_id, p, state)
+    return {"code": f"{raw[:4]}_{raw[4:]}", "value": value, "actions": actions, "acknowledge": acknowledge}
 
 
 def print_options(p: dict, has_ams: bool) -> dict:
@@ -336,6 +379,21 @@ def _public_slot(ams_id: int, tray_id: int, *, dual: bool) -> int:
     if ams_id == 255:
         return 255 if dual else EXTERNAL_SLOT
     return ams_id * 4 + tray_id
+
+
+def _filament_change(p: dict, ams_block: dict, extruder: dict | None, *, dual: bool) -> dict | None:
+    """A filament change in progress (`ams_status` bits 8–15 = 1, as Bambu Studio checks): `{"target": slot}` for the
+    slot being loaded, `{"target": None}` while unloading. The target is `tray_tar` (255 = unloading), numbered like
+    `tray_now`; printers with `device.extruder` report it as the active extruder's `star`, like `snow`."""
+    ams_status = _int(p.get("ams_status"))
+    if ams_status is None or ams_status >> 8 & 0xFF != recovery.AMS_FILAMENT_CHANGE:
+        return None
+    target = _int(ams_block.get("tray_tar"))
+    target = None if target in (None, 255) else target
+    star = _int((extruder or {}).get("star"))
+    if star is not None and star != 0xFFFF:
+        target = None if star & 0xFF == 0xFF else _public_slot(star >> 8 & 0xFF, star & 0xFF, dual=dual)
+    return {"target": target}
 
 
 def _tray(raw: dict, ams_id: int | None, *, dual: bool = False, extruder_id: int | None = None) -> dict:
@@ -482,6 +540,7 @@ def normalize(raw: dict, *, connected: bool, last_message_at: float | None, prin
         loaded_ams, loaded_tray = loaded >> 8 & 0xFF, loaded & 0xFF
         if loaded_tray != 0xFF:
             active_slot = _public_slot(loaded_ams, loaded_tray, dual=dual)
+    change = _filament_change(p, ams_block, extruder_raw.get(active_extruder), dual=dual)
 
     bed_current, bed_target = None, None
     if "bed_temp" in device:
@@ -544,9 +603,11 @@ def normalize(raw: dict, *, connected: bool, last_message_at: float | None, prin
             "calibration": calibrating,
             "stages": stage_plan(p) if active else [],
             "print_error": _int(p.get("print_error"), 0),
-            # Readable display error code; hms.Texts adds the text.
-            "error": print_error(p),
+            # Readable display error code and its recovery actions; hms.Texts adds the text.
+            "error": print_error(p, model_id, state),
             "subtask_id": str(p["subtask_id"]) if p.get("subtask_id") not in (None, "") else None,
+            # Cloud job of the print; recovery actions name it, as Bambu Studio does (empty for LAN prints).
+            "job_id": str(p["job_id"]) if p.get("job_id") not in (None, "") else None,
             "prepare_percent": _int(p.get("gcode_file_prepare_percent")),
             "plate_index": plate_index(p),
             "skipped_objects": [i for i in (_int(v) for v in p.get("s_obj") or []) if i is not None],
@@ -569,7 +630,8 @@ def normalize(raw: dict, *, connected: bool, last_message_at: float | None, prin
         },
         "speed": {"level": speed, "name": SPEED_LEVELS.get(speed or 0), "percent": _int(p.get("spd_mag"))},
         "lights": {"chamber": lights.get("chamber_light"), "chamber2": lights.get("chamber_light2")},
-        "ams": {"units": units, "external": external, "externals": external_items, "active_slot": active_slot},
+        "ams": {"units": units, "external": external, "externals": external_items, "active_slot": active_slot,
+                "change": change},
         "hms": hms,
         "nozzle": _nozzle(p, device, active_extruder),
         "homed": homed_axes(p.get("home_flag")),

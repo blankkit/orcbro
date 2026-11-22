@@ -4,8 +4,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
+from aiohttp.streams import StreamReader
 from aiohttp.test_utils import make_mocked_request
 
 from bridge.auth import Principal
@@ -21,8 +22,16 @@ from bridge.server import (PRINCIPAL, PUSH, JOBS, _run_slice, _send_event, app_t
 from bridge.state import STAGES, normalize
 from bridge.web import invitation_page
 from bridge.identity import BridgeIdentity
-from helpers import FILAMENT_IDS, PROFILES
+from helpers import FILAMENT_IDS, MODELS, PROFILES
 from test_live import FakeAPNs, status
+
+
+def json_payload(body) -> StreamReader:
+    """Request body for `make_mocked_request`, read by `request.json()` like a real one."""
+    payload = StreamReader(Mock(_reading_paused=False), 2 ** 16, loop=asyncio.get_running_loop())
+    payload.feed_data(json.dumps(body).encode())
+    payload.feed_eof()
+    return payload
 
 
 class LanguageTests(unittest.TestCase):
@@ -85,7 +94,8 @@ class RequestLanguageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.config = Config(data_dir=Path(self.tmp.name), profiles_dir=PROFILES, filament_ids=FILAMENT_IDS,
-                             bridge_token="test-access-key-with-enough-characters", tls=False, mdns=False)
+                             models_dir=MODELS, bridge_token="test-access-key-with-enough-characters", tls=False,
+                             mdns=False)
         self.app = create_app(self.config, start_background=False)
         self.app.freeze()
         self.auth = {"Authorization": f"Bearer {app_token(self.config.bridge_token)}"}
@@ -98,9 +108,11 @@ class RequestLanguageTests(unittest.IsolatedAsyncioTestCase):
         headers = dict(self.auth) if authenticated else {}
         if language is not None:
             headers["Accept-Language"] = language
-        request = make_mocked_request(method, path, headers=headers, app=self.app)
+        extra = {}
         if body is not None:
-            request.json = AsyncMock(return_value=body)
+            headers["Content-Type"] = "application/json"
+            extra["payload"] = json_payload(body)
+        request = make_mocked_request(method, path, headers=headers, app=self.app, **extra)
         return await self.app._handle(request)
 
     async def test_api_errors_follow_request_and_default_to_english(self):
@@ -112,7 +124,7 @@ class RequestLanguageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current_language(), "en")
 
     async def test_setup_and_invitation_pages(self):
-        for language, label in (("en", "Printer"), ("de", "Drucker")):
+        for language, label in (("en", "Pair"), ("de", "Koppeln")):
             response = await self.call("/", language=language)
             self.assertIn(f'<html lang="{language}">', response.text)
             self.assertIn(f'>{label}</p>', response.text)
@@ -272,9 +284,9 @@ class PushLanguageTests(unittest.IsolatedAsyncioTestCase):
             app = web.Application()
             app[PUSH] = registry
             app[DEVICES] = SimpleNamespace(devices={"serial": object()}, default_id="serial")
-            request = make_mocked_request("POST", "/api/live/register", app=app)
+            body = {"kind": "update", "token": "ab" * 32, "environment": "production", "language": "de"}
+            request = make_mocked_request("POST", "/api/live/register", {"Content-Type": "application/json"}, app=app,
+                                          payload=json_payload(body))
             request[PRINCIPAL] = Principal("device", "device")
-            request.json = AsyncMock(return_value={"kind": "update", "token": "ab" * 32,
-                                                   "environment": "production", "language": "de"})
             self.assertEqual((await live_register(request)).status, 200)
             self.assertEqual(Registry(registry.path).section("serial").activities["ab" * 32]["language"], "de")

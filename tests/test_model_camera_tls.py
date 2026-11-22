@@ -6,8 +6,8 @@ from unittest import mock
 from bridge import ftps
 from bridge.camera import Camera
 from bridge.camera_rtsp import MjpegParser, RtspCamera, stream_url
-from bridge.printer import tls_context
 from bridge.probe import _tls
+from bridge.trust import PrinterTrust
 
 
 class CameraSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -53,7 +53,7 @@ class CameraSelectionTests(unittest.IsolatedAsyncioTestCase):
 
 class TlsLimitTests(unittest.TestCase):
     def test_mqtt_and_probe_cap_tls_at_12(self):
-        self.assertEqual(tls_context().maximum_version, ssl.TLSVersion.TLSv1_2)
+        self.assertEqual(PrinterTrust("01P00A000000000").context().maximum_version, ssl.TLSVersion.TLSv1_2)
         self.assertEqual(_tls().maximum_version, ssl.TLSVersion.TLSv1_2)
 
     def test_ftps_keeps_session_reuse_and_caps_tls(self):

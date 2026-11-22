@@ -7,9 +7,11 @@ from __future__ import annotations
 from .i18n import m, message_of
 
 import asyncio
+import ipaddress
 import json
 import re
 import secrets
+import socket
 import ssl
 import time
 
@@ -17,6 +19,7 @@ import aiomqtt
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 
+from .printer import login_refused
 from .state import normalize
 from .trust import PrinterTrust, base_context, fingerprint
 
@@ -69,9 +72,37 @@ async def read_identity(host: str, timeout: float = 8) -> tuple[str, str]:
     return serial_from_certificate(der), fingerprint(der)
 
 
+def local_address(address: str) -> bool:
+    """Printer addresses the app may probe: private IPv4, unique local IPv6 and link-local addresses.
+    Loopback, public, multicast and unspecified addresses are excluded, so a paired device cannot use the bridge
+    to test TLS ports elsewhere."""
+    try:
+        parsed = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    if parsed.version == 6 and parsed.ipv4_mapped:
+        parsed = parsed.ipv4_mapped
+    if parsed.is_loopback or parsed.is_multicast or parsed.is_unspecified or parsed.is_reserved:
+        return False
+    return parsed.is_link_local or parsed.is_private
+
+
+async def resolve_local(host: str) -> str:
+    """Resolve `host` once and return a local address to connect to (see `local_address`). Connecting to that
+    address, not the name, keeps a second DNS answer from redirecting the connection."""
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, 8883, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as exc:
+        raise ProbeError("unreachable", m('No printer is responding at {p0}. Check the IP address: The printer must be on and on the same network, with LAN Only mode enabled.', p0=host)) from exc
+    for _family, _type, _proto, _name, sockaddr in infos:
+        if local_address(str(sockaddr[0])):
+            return str(sockaddr[0])
+    raise ProbeError("not_local", m('{p0} is not an address on the local network. Enter the printer’s local IP address (for example 192.168.x.x).', p0=host))
+
+
 def _mqtt_error(exc: Exception, host: str) -> ProbeError:
     text = message_of(exc)
-    if "Not authorized" in text or "code:5" in text or "Bad user name or password" in text or "code:4" in text:
+    if login_refused(text):
         return ProbeError("access_code", m('Incorrect access code. Find it on the printer under Settings → WLAN (or Network). It changes when the printer switches Wi-Fi networks.'))
     return ProbeError("unreachable", m('Could not connect to {p0}: {p1}', p0=host, p1=text or exc.__class__.__name__))
 
@@ -80,9 +111,10 @@ async def probe(host: str, access_code: str, serial: str | None = None, timeout:
                 pin: str | None = None) -> dict:
     """Log in and query version and status without changing printer settings.
 
-    Before login, the certificate must match the expected `serial` and optional saved `pin`.
-    Bind login to that certificate and return its fingerprint with the result."""
-    found, seen = await read_identity(host)
+    Only local addresses are probed (`resolve_local`). Before login, the certificate must match the expected
+    `serial` and optional saved `pin`. Bind login to that certificate and return its fingerprint with the result."""
+    address = await resolve_local(host)
+    found, seen = await read_identity(address)
     expected = (serial or "").strip().upper()
     if expected and found != expected:
         raise ProbeError("other_printer", m('A different printer is responding at this address.'))
@@ -93,8 +125,8 @@ async def probe(host: str, access_code: str, serial: str | None = None, timeout:
     version: dict = {}
     raw: dict = {}
     try:
-        async with aiomqtt.Client(hostname=host, port=8883, username="bblp", password=access_code,
-                                  tls_context=trust.context(), identifier=f"bambu-bridge-probe-{secrets.token_hex(3)}",
+        async with aiomqtt.Client(hostname=address, port=8883, username="bblp", password=access_code,
+                                  tls_context=trust.context(), identifier=f"orcbro-probe-{secrets.token_hex(4)}",
                                   keepalive=15, timeout=timeout) as client:
             await client.subscribe(f"device/{serial}/report")
             await client.publish(f"device/{serial}/request", json.dumps(

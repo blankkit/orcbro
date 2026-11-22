@@ -27,6 +27,15 @@ MAGIC = b"OPV1"
 VERSION = 1
 MAX_POINTS = 2_000_000
 UNIT = 100.0  # 0.01 mm
+# Bounds while building, before `reduce`: paths are split at MAX_PATH_POINTS; above MAX_BUILD_POINTS, the layers read
+# so far are simplified with the next tolerance; the format allows 255 path types. SIMPLIFY_WORK caps the
+# Douglas-Peucker steps per preview (adversarial paths make it quadratic).
+TOLERANCES = (0.02, 0.05, 0.1, 0.2, 0.4)
+MAX_BUILD_POINTS = 2 * MAX_POINTS
+MAX_PATH_POINTS = 20_000
+MAX_FEATURES = 255
+MAX_FEATURE_NAME = 64
+SIMPLIFY_WORK = 400_000_000
 
 _WORD = re.compile(r"([XYZEIJF])(-?\d*\.?\d+)")
 
@@ -38,18 +47,38 @@ class Layer:
     paths: list[tuple[int, list[tuple[float, float]]]] = field(default_factory=list)
 
 
+class TooComplex(ValueError):
+    """The G-code exceeds the preview's work or size budget."""
+
+
+class Budget:
+    """Remaining simplification steps for one preview."""
+
+    def __init__(self, steps: int = SIMPLIFY_WORK):
+        self.steps = steps
+
+    def spend(self, steps: int) -> None:
+        self.steps -= steps
+        if self.steps < 0:
+            raise TooComplex(m('The G-code is too complex for a preview.'))
+
+
 @dataclass
 class Preview:
     bed: tuple[float, float]
     features: list[str]
     layers: list[Layer]
+    # Index into TOLERANCES already applied while building, -1 for none.
+    simplified: int = -1
 
     @property
     def point_count(self) -> int:
         return sum(len(points) for layer in self.layers for _, points in layer.paths)
 
 
-def parse_gcode(lines, bed: tuple[float, float] = (256.0, 256.0)) -> Preview:
+def parse_gcode(lines, bed: tuple[float, float] = (256.0, 256.0), budget: Budget | None = None) -> Preview:
+    """Build the preview. Memory stays bounded: see MAX_BUILD_POINTS and the other limits above."""
+    budget = budget or Budget()
     features: list[str] = []
     feature_index: dict[str, int] = {}
     layers: list[Layer] = []
@@ -57,26 +86,48 @@ def parse_gcode(lines, bed: tuple[float, float] = (256.0, 256.0)) -> Preview:
     x = y = z = e = 0.0
     current: list[tuple[float, float]] | None = None
     current_feature = -1
+    points = 0
+    level = -1
 
     def feature_id(name: str) -> int:
-        name = name.strip() or m('Unknown')
+        name = name.strip()[:MAX_FEATURE_NAME] or m('Unknown')
         if name not in feature_index:
+            if len(features) >= MAX_FEATURES:
+                return 0  # The first type is "Unknown".
             feature_index[name] = len(features)
             features.append(name)
         return feature_index[name]
 
     def close_path() -> None:
-        nonlocal current
+        nonlocal current, points
         if current is not None and len(current) >= 2 and layers:
-            layers[-1].paths.append((current_feature, current))
+            path = simplify(current, TOLERANCES[level], budget) if level >= 0 else current
+            layers[-1].paths.append((current_feature, path))
+            points += len(path)
+            if points > MAX_BUILD_POINTS:
+                tighten()
         current = None
+
+    def tighten() -> None:
+        nonlocal level, points
+        while points > MAX_BUILD_POINTS:
+            level += 1
+            if level >= len(TOLERANCES):
+                raise TooComplex(m('The G-code is too complex for a preview.'))
+            for layer in layers:
+                layer.paths = [(f, simplify(path, TOLERANCES[level], budget)) for f, path in layer.paths]
+            points = sum(len(path) for layer in layers for _, path in layer.paths)
 
     def new_layer(layer_z: float | None) -> None:
         close_path()
         layer_z = layer_z if layer_z is not None else z
         # Provisional height from the Z delta; Bambu's later `; LAYER_HEIGHT:` overrides it.
         height = layer_z - layers[-1].z if layers else layer_z
-        layers.append(Layer(z=layer_z, height=round(max(height, 0.0), 4)))
+        layer = Layer(z=layer_z, height=round(max(height, 0.0), 4))
+        if layers and not layers[-1].paths:
+            layers[-1] = layer  # Layers without paths are dropped anyway; do not collect them.
+        else:
+            layers.append(layer)
 
     feature = feature_id(m('Unknown'))
     for raw in lines:
@@ -138,6 +189,10 @@ def parse_gcode(lines, bed: tuple[float, float] = (256.0, 256.0)) -> Preview:
                 current.extend(_arc(x, y, nx, ny, words.get("I", 0.0), words.get("J", 0.0), command == "G2"))
             else:
                 current.append((nx, ny))
+            if len(current) >= MAX_PATH_POINTS:
+                last = current[-1]
+                close_path()
+                current, current_feature = [last], feature
         elif moved_xy:
             close_path()
         x, y, z = nx, ny, nz
@@ -146,8 +201,8 @@ def parse_gcode(lines, bed: tuple[float, float] = (256.0, 256.0)) -> Preview:
     used = sorted({f for layer in layers for f, _ in layer.paths})
     remap = {old: new for new, old in enumerate(used)}
     for layer in layers:
-        layer.paths = [(remap[f], points) for f, points in layer.paths]
-    return Preview(bed=bed, features=[features[i] for i in used], layers=layers)
+        layer.paths = [(remap[f], path) for f, path in layer.paths]
+    return Preview(bed=bed, features=[features[i] for i in used], layers=layers, simplified=level)
 
 
 def _float(text: str) -> float | None:
@@ -174,7 +229,8 @@ def _arc(x0: float, y0: float, x1: float, y1: float, i: float, j: float, clockwi
     return points
 
 
-def simplify(points: list[tuple[float, float]], tolerance: float) -> list[tuple[float, float]]:
+def simplify(points: list[tuple[float, float]], tolerance: float,
+             budget: Budget | None = None) -> list[tuple[float, float]]:
     """Iterative Douglas-Peucker simplification, preserving both endpoints."""
     if len(points) < 3 or tolerance <= 0:
         return points
@@ -184,6 +240,8 @@ def simplify(points: list[tuple[float, float]], tolerance: float) -> list[tuple[
     tol2 = tolerance * tolerance
     while stack:
         first, last = stack.pop()
+        if budget is not None:
+            budget.spend(last - first)
         ax, ay = points[first]
         bx, by = points[last]
         dx, dy = bx - ax, by - ay
@@ -205,11 +263,14 @@ def simplify(points: list[tuple[float, float]], tolerance: float) -> list[tuple[
     return [p for p, k in zip(points, keep) if k]
 
 
-def reduce(preview: Preview, limit: int = MAX_POINTS) -> Preview:
-    """Simplify paths until at most `limit` points remain."""
-    for tolerance in (0.02, 0.05, 0.1, 0.2, 0.4):
+def reduce(preview: Preview, limit: int = MAX_POINTS, budget: Budget | None = None) -> Preview:
+    """Simplify paths until at most `limit` points remain, continuing from tolerances applied while building."""
+    if preview.simplified >= 0 and preview.point_count <= limit:
+        return preview
+    for level in range(max(preview.simplified, 0), len(TOLERANCES)):
         for layer in preview.layers:
-            layer.paths = [(f, simplify(points, tolerance)) for f, points in layer.paths]
+            layer.paths = [(f, simplify(points, TOLERANCES[level], budget)) for f, points in layer.paths]
+        preview.simplified = level
         if preview.point_count <= limit:
             break
     return preview
@@ -270,10 +331,10 @@ def decode(data: bytes) -> Preview:
 
 def build_from_3mf(path: Path, plate: int, bed: tuple[float, float]) -> bytes:
     """Read Metadata/plate_N.gcode from a sliced 3MF and return an OPV1 preview."""
-    from .jobs import open_archive  # Late import keeps preview independent of jobs.
+    from .jobs import gcode_lines, open_archive  # Late import keeps preview independent of jobs.
 
+    budget = Budget()
     with open_archive(path) as archive:
-        with archive.open(f"Metadata/plate_{plate}.gcode") as raw:
-            text = io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
-            preview = parse_gcode(text, bed)
-    return encode(reduce(preview))
+        lines = (line.decode("utf-8", "replace") for line in gcode_lines(archive, f"Metadata/plate_{plate}.gcode"))
+        preview = parse_gcode(lines, bed, budget)
+    return encode(reduce(preview, budget=budget))

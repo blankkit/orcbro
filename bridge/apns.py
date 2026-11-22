@@ -8,6 +8,7 @@ from __future__ import annotations
 from .i18n import m
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,21 @@ TOKEN_LIFETIME = 40 * 60
 
 # Responses that invalidate a device token and require forgetting it.
 GONE_REASONS = {"BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "ExpiredToken"}
+
+_DEVICE_PATH = re.compile(r"/3/device/[^\s\"'?/]+")
+
+
+class RedactDeviceTokens(logging.Filter):
+    """HTTPX logs every request URL at INFO; APNs URLs contain the device token. Keep the log line, not the token."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "/3/device/" in message:
+            record.msg, record.args = _DEVICE_PATH.sub("/3/device/<token>", message), None
+        return True
+
+
+_REDACT = RedactDeviceTokens()
 
 
 class APNsError(Exception):
@@ -57,6 +73,8 @@ class APNsClient:
         self._token: str | None = None
         self._token_at = 0.0
         self._client = httpx.AsyncClient(http2=transport is None, transport=transport, timeout=15)
+        if _REDACT not in logging.getLogger("httpx").filters:
+            logging.getLogger("httpx").addFilter(_REDACT)
 
     def provider_token(self) -> str:
         now = time.time()

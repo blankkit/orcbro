@@ -128,6 +128,21 @@ class FilamentTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             build("read_rfid", 2, status_with(gcode_state="RUNNING"))
 
+    def test_read_rfid_refuses_external_spools_from_vir_slot(self):
+        # P2S/H2D report external spools as `vir_slot` entries with AMS ID 254/255; they have no chip reader.
+        from bridge.state import normalize
+        raw = {"gcode_state": "IDLE", "ams": {"ams": [{"id": "0", "info": "00000003", "tray": [
+            {"id": "0", "tray_type": "PLA"}]}], "vir_slot": [{"id": "254", "tray_type": "TPU"},
+                                                             {"id": "255", "tray_type": "PLA"}]}}
+        for model_id, slots in (("O1D", (254, 255)), ("N7", (254,))):
+            status = normalize(copy.deepcopy(raw), connected=True, last_message_at=1, printer={"model_id": model_id})
+            for slot in slots:
+                with self.subTest(model=model_id, slot=slot), self.assertRaises(ControlError) as refused:
+                    build("read_rfid", slot, status)
+                self.assertEqual(refused.exception.status, 422)
+            (_, body), = build("read_rfid", 0, status)
+            self.assertEqual(body, {"command": "ams_get_rfid", "ams_id": 0, "slot_id": 0})
+
     def test_read_rfid_on_older_firmware_uses_gcode(self):
         idle = status_with(gcode_state="IDLE")
         idle["ams"]["active_slot"] = None
@@ -311,10 +326,6 @@ class SDCardTests(unittest.TestCase):
                 sd_path(bad)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ListRetryTests(unittest.TestCase):
     def test_list_dir_retries_once(self):
         from unittest import mock
@@ -387,3 +398,46 @@ class OptionTests(unittest.TestCase):
                                                                "print_error": 0x0300400C}))
         self.assertEqual(dialog_section, "system")
         self.assertEqual((dialog_body["command"], dialog_body["err"]), ("uiop", "0300400C"))
+
+    def test_error_action(self):
+        status = status_with(gcode_state="PAUSE", print_error=0x07008011, job_id=4711)
+        self.assertEqual(status["job"]["error"]["actions"], ["resume_solved"])
+        (section, body), close = controls.error_action({"code": "0700_8011", "action": "resume_solved"}, status)
+        # As Bambu Studio's `command_hms_resume`: decimal message code, job ID, then close the dialog.
+        self.assertEqual((section, body), ("print", {"command": "resume", "err": "117473297", "param": "reserve",
+                                                     "job_id": "4711"}))
+        self.assertEqual(close, ("system", {"command": "uiop", "name": "print_error", "action": "close", "source": 1,
+                                            "type": "dialog", "err": "07008011"}))
+        for value, code in (({"code": "0700_8012", "action": "resume_solved"}, 409),  # A newer message.
+                            ({"code": "0700_8011", "action": "stop"}, 409),  # Not offered for this message.
+                            ({"code": "0700_8011"}, 422), ("resume_solved", 422)):
+            with self.subTest(value=value), self.assertRaises(ControlError) as refused:
+                controls.error_action(value, status)
+            self.assertEqual(refused.exception.status, code)
+        with self.assertRaises(ControlError) as refused:
+            controls.error_action({"code": "0700_8011", "action": "resume_solved"}, status_with())
+        self.assertEqual(refused.exception.status, 409)
+
+    def test_error_action_commands(self):
+        cases = [
+            (0x03008007, "stop", {"command": "stop", "err": str(0x03008007), "param": "reserve", "job_id": ""}),
+            (0x07FF8007, "extruded", {"command": "ams_control", "param": "done"}),
+            (0x07FF8007, "retry_extrusion", {"command": "ams_control", "param": "resume"}),
+            (0x07008006, "continue", {"command": "ams_control", "param": "resume"}),
+            (0x0C008034, "ignore_resume", {"command": "ignore", "err": str(0x0C008034), "param": "reserve",
+                                           "job_id": ""}),
+            (0x05004042, "stop_drying", {"command": "auto_stop_ams_dry"}),
+        ]
+        for value, action, expected in cases:
+            raw = f"{value:08X}"
+            status = status_with(gcode_state="PAUSE", print_error=value)
+            with self.subTest(action=action):
+                (_, body), _ = controls.error_action({"code": f"{raw[:4]}_{raw[4:]}", "action": action}, status)
+                self.assertEqual(body, expected)
+        idle = status_with(gcode_state="IDLE", print_error=0x07008006, ams_status=0x0103)
+        (_, body), _ = controls.error_action({"code": "0700_8006", "action": "abort"}, idle)
+        self.assertEqual(body, {"command": "ams_control", "param": "abort"})
+
+
+if __name__ == "__main__":
+    unittest.main()

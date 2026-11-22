@@ -9,6 +9,7 @@ from bridge.config import Config
 from bridge.identity import BridgeIdentity, load_identity
 from bridge.server import create_app
 from bridge.tls import TLSState, prepare_tls
+from helpers import MODELS
 
 
 class ImmediateEvent:
@@ -76,7 +77,7 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch("bridge.__main__.web.TCPSite", FakeSite), \
                 mock.patch("bridge.__main__.asyncio.Event", ImmediateEvent), \
                 mock.patch("bridge.__main__.asyncio.get_running_loop", return_value=loop):
-            await serve(Config(data_dir=Path(tmp), port=8080, https_port=8443))
+            await serve(Config(models_dir=MODELS, data_dir=Path(tmp), port=8080, https_port=8443))
         self.assertEqual(len(FakeRunner.instances), 1)
         self.assertTrue(FakeRunner.instances[0].setup_called)
         self.assertTrue(FakeRunner.instances[0].cleanup_called)
@@ -99,7 +100,7 @@ class ForeignDataDirectoryTests(unittest.TestCase):
                     raise PermissionError(1, "Operation not permitted", str(path))
                 return real_chmod(path, mode, *args, **kwargs)
 
-            config = Config(bridge_token=None, data_dir=data, mdns=False)
+            config = Config(models_dir=MODELS, bridge_token=None, data_dir=data, mdns=False)
             with mock.patch("os.chmod", side_effect=guarded):
                 identity = load_identity(config.auth_dir / "bridge.json", config.bridge_name)
                 tls_state = prepare_tls(config, identity)

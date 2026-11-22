@@ -10,7 +10,7 @@ import asyncio
 import itertools
 import json
 import logging
-import ssl
+import secrets
 import time
 from collections.abc import Callable
 
@@ -18,18 +18,21 @@ import aiomqtt
 
 from .models import Model, Models
 from .state import merge, normalize
-from .trust import CHANGED, PrinterTrust, base_context
+from .trust import CHANGED, PrinterTrust
 
 log = logging.getLogger(__name__)
 
 # P1 printers have limited resources; request full `pushall` status only every few minutes.
 PUSHALL_INTERVAL = 300
 PUSHALL_MIN_GAP = 30
+# Stands in for the bridge ID where a printer is created without one (tests, tools).
+_INSTANCE = secrets.token_hex(4)
 
 
-def tls_context() -> ssl.SSLContext:
-    """Unpinned MQTT context for tests; TLS 1.3 hangs on some P2S firmware versions."""
-    return base_context()
+def client_id(serial: str, bridge_id: str | None = None) -> str:
+    """MQTT client ID, at most 23 characters: the same for one bridge and printer, so a reconnect replaces the
+    bridge's own stale session, and different for every other bridge, which would otherwise push this one off."""
+    return f"orcbro-{(bridge_id or _INSTANCE)[:8]}-{serial[-6:]}"
 
 
 class PrinterError(Exception):
@@ -38,9 +41,11 @@ class PrinterError(Exception):
 
 class Printer:
     def __init__(self, host: str, serial: str, access_code: str, name: str = "Bambu Lab", *,
-                 models: Models | None = None, model_hint: str | None = None, trust: PrinterTrust | None = None):
+                 models: Models | None = None, model_hint: str | None = None, trust: PrinterTrust | None = None,
+                 bridge_id: str | None = None):
         self.host = host
         self.serial = serial
+        self.bridge_id = bridge_id
         # Pinned certificate: do not log in unless the fingerprint matches (trust.py).
         self.trust = trust or PrinterTrust(serial)
         self._code = access_code
@@ -114,7 +119,9 @@ class Printer:
             if future and not future.done():
                 future.set_result(body)
             if section == "print" and body.get("command") == "push_status":
-                merge(self.raw, {k: v for k, v in body.items() if k not in ("command", "sequence_id", "msg")})
+                # `msg` 0 marks a full report (the `pushall` reply), 1 a partial update.
+                merge(self.raw, {k: v for k, v in body.items() if k not in ("command", "sequence_id", "msg")},
+                      full=body.get("msg") == 0)
                 changed = True
             elif section == "info" and body.get("command") == "get_version":
                 self.version = body
@@ -132,7 +139,7 @@ class Printer:
             try:
                 async with aiomqtt.Client(
                     hostname=self.host, port=8883, username="bblp", password=self._code,
-                    tls_context=context, identifier=f"bambu-bridge-{self.serial[-6:]}", keepalive=30, timeout=15,
+                    tls_context=context, identifier=client_id(self.serial, self.bridge_id), keepalive=30, timeout=15,
                 ) as client:
                     self._client = client
                     self.connected = True
@@ -223,11 +230,16 @@ class Printer:
         return reply
 
 
+def login_refused(text: str) -> bool:
+    """Does an MQTT connection error mean the printer refused the access code? Also used by `probe`."""
+    return any(sign in text for sign in ("Not authorized", "Bad user name or password", "code:4", "code:5"))
+
+
 def _describe(exc: Exception) -> str:
     text = message_of(exc) or exc.__class__.__name__
     if m('printer certificate has changed') in text:
         return CHANGED
-    if "Not authorized" in text or "code:5" in text or "Bad user name or password" in text:
+    if login_refused(text):
         return m('Incorrect access code (Printer → Settings → WLAN).')
     if "timed out" in text.lower():
         return m('Printer not responding (off, not on Wi-Fi or LAN Only mode is off).')

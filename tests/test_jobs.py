@@ -105,10 +105,6 @@ class CameraProtocolTests(unittest.TestCase):
         self.assertFalse(is_jpeg(b"\x89PNG"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ArchiveLimitTests(unittest.TestCase):
     """Bound uncompressed metadata/archive sizes even when the compressed file is small."""
 
@@ -134,3 +130,7 @@ class ArchiveLimitTests(unittest.TestCase):
         with mock.patch.object(jobs, "MAX_ARCHIVE_ENTRIES", 5):
             with self.assertRaises(jobs.JobError):
                 jobs.open_archive(path)
+
+
+if __name__ == "__main__":
+    unittest.main()

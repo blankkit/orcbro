@@ -1,18 +1,24 @@
-# Orcbro – minimal setup. Start with `docker compose up -d`, then open http://<host>:8080 for the pairing QR code.
+# Orcbro – minimal setup. Start with `docker compose up -d`, then `docker compose logs orcbro` shows the setup code
+# for the first iPhone (valid for one hour; `docker compose restart orcbro` issues a new one). Type it in Bambro, or
+# enter it at https://<host>:8443 to get a QR code. The setup page never shows the code itself.
 services:
   orcbro:
     image: ghcr.io/blankkit/orcbro:latest
     restart: unless-stopped
     # Host networking lets Bambro find the bridge via Bonjour and reach printers on the LAN directly.
-    # Without it, publish ports 8080/8443 and pair by scanning the QR code or typing the address.
+    # Without it, publish ports 8080/8443 and pair by typing the address and setup code in Bambro.
+    # Behind a reverse proxy, see "Behind a reverse proxy" in the README instead (no host networking there).
     network_mode: host
     volumes:
       - orcbro-data:/data
     environment:
-      TZ: Europe/Berlin
-      # Optional: a printer from the environment (otherwise add printers in the app).
+      TZ: Europe/Berlin   # time zone for log timestamps; set yours (without it, UTC)
+      # Optional: a printer from the environment (otherwise add printers in the app). The bridge reads its serial
+      # number on first start and keeps it; set BAMBU_SERIAL (or a new access code) to switch printers.
       # BAMBU_HOST: 192.168.1.50
       # BAMBU_ACCESS_CODE: 12345678
+      # Optional: a fixed pairing key instead of the setup code (20+ characters).
+      # BRIDGE_ACCESS_TOKEN: <output of `openssl rand -base64 30`>
 
 volumes:
   orcbro-data:

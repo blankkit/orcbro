@@ -11,8 +11,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from bridge.config import Config, ConfigError
 from bridge.printer import Printer, PrinterError
+from bridge import server
 from bridge.server import PUSH, app_token, build_mapping, create_app
-from helpers import FILAMENT_IDS, PROFILES, load, project_3mf, sliced_3mf
+from helpers import FILAMENT_IDS, MODELS, PROFILES, load, project_3mf, sliced_3mf
 
 SECRET = "s3cret-bridge-access-token"
 
@@ -34,7 +35,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.config = Config(
             host="192.0.2.10", serial="01P00A000000000", access_code="12345678", bridge_token=SECRET,
-            data_dir=Path(self.tmp.name), profiles_dir=PROFILES, filament_ids=FILAMENT_IDS,
+            data_dir=Path(self.tmp.name), profiles_dir=PROFILES, filament_ids=FILAMENT_IDS, models_dir=MODELS,
             orca_cmd=(sys.executable, str(Path(__file__).parent / "fake_orca.py")))
         self.printer = Printer(self.config.host, self.config.serial, self.config.access_code, "Test")
         self.printer.handle(load("pushall_p1s.json"))
@@ -45,6 +46,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
         self.auth = {"Authorization": f"Bearer {app_token(SECRET)}"}
+        poll = mock.patch("bridge.server.START_POLL", 0.02)  # The fake printer reports the start right away.
+        poll.start()
+        self.addCleanup(poll.stop)
 
     async def asyncTearDown(self):
         await self.client.close()
@@ -61,14 +65,15 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             if job["state"] in states:
                 return job
             await asyncio.sleep(0.05)
-        self.fail(f"Auftrag blieb in {job['state']}")
+        self.fail(f"Job stayed in {job['state']}")
 
     def printer_starts(self):
-        """Fake print command: report PREPARE with the submitted filename afterward."""
+        """Fake print command: the reply comes first and the printer reports PREPARE with the submitted filename
+        afterward, as a real printer does."""
         async def command(section, body, wait=15):
             if body.get("command") == "project_file":
-                self.printer.handle({"print": {"command": "push_status", "gcode_state": "PREPARE",
-                                               "gcode_file": body["url"].rsplit("/", 1)[-1]}})
+                asyncio.get_running_loop().call_soon(self.printer.handle, {"print": {
+                    "command": "push_status", "gcode_state": "PREPARE", "gcode_file": body["url"].rsplit("/", 1)[-1]}})
             return {"result": "success"}
         return mock.AsyncMock(side_effect=command)
 
@@ -348,33 +353,42 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await thumb.read(), b"\x89PNG ohne Licht")
 
     async def test_set_tray(self):
-        with mock.patch.object(self.printer, "command", mock.AsyncMock(return_value={"result": "success"})) as cmd:
+        with mock.patch.object(self.printer, "command", mock.AsyncMock(return_value={"result": "success"})) as cmd, \
+                mock.patch.object(self.printer, "pushall", mock.AsyncMock()) as pushall, \
+                mock.patch("bridge.server._pushall_after", mock.AsyncMock()) as later:
             response = await self.client.post("/api/ams/tray", headers=self.auth,
                                               json={"slot": 0, "filament": "Generic PETG", "color": "#202020"})
             self.assertEqual(response.status, 200, await response.text())
             section, body = cmd.call_args.args
+            await asyncio.sleep(0)
         self.assertEqual(body["command"], "ams_filament_setting")
         self.assertEqual(body["tray_type"], "PETG")
+        # The printer may still report the previous filament at first: full status now and again a few seconds later.
+        pushall.assert_awaited_once_with(force=True)
+        self.assertEqual(later.await_args.args, (self.printer, server.AMS_SETTING_PUSHALL))
         response = await self.client.post("/api/ams/tray", headers=self.auth,
                                           json={"slot": 0, "filament": "Fremdes PLA", "color": "#202020"})
         self.assertEqual(response.status, 422)
 
     async def test_sdcard_import_prints_in_place(self):
+        data = sliced_3mf()
+
         def fake_download(host, code, remote, local, *rest, **_kw):
-            Path(local).write_bytes(sliced_3mf())
-        listing = [{"name": "Unbenannt.gcode.3mf", "size": 10, "is_dir": False, "modified": "Nov 20 14:48"},
+            Path(local).write_bytes(data)
+        listing = [{"name": "Unbenannt.gcode.3mf", "size": len(data), "is_dir": False, "modified": "Nov 20 14:48"},
                    {"name": "Unbenannt_plate_1.gcode", "size": 10, "is_dir": False, "modified": "2023-08-31"},
                    {"name": "._Unbenannt.gcode.3mf", "size": 4096, "is_dir": False, "modified": "2025-06-24"}]
-        with mock.patch("bridge.server.ftps.list_dir", lambda h, c, d, **_kw: listing if d == "/" else []):
+        card = mock.patch("bridge.server.ftps.list_dir", lambda h, c, d, **_kw: listing if d == "/" else [])
+        with card:
             files = (await (await self.client.get("/api/sdcard", headers=self.auth)).json())["files"]
         self.assertEqual([f["path"] for f in files], ["/Unbenannt.gcode.3mf"])
-        with mock.patch("bridge.server.ftps.download", fake_download):
+        with mock.patch("bridge.server.ftps.download", fake_download), card:
             response = await self.client.post("/api/sdcard/import", json={"path": "/Unbenannt.gcode.3mf"}, headers=self.auth)
         job = await response.json()
         self.assertEqual(response.status, 201, job)
         self.assertEqual(job["remote_path"], "Unbenannt.gcode.3mf")
         upload = mock.Mock()
-        with mock.patch("bridge.server.ftps.upload", upload), \
+        with mock.patch("bridge.server.ftps.upload", upload), card, \
                 mock.patch.object(self.printer, "command", self.printer_starts()) as cmd:
             response = await self.client.post(f"/api/jobs/{job['id']}/print", json={"mapping": {"1": 2}}, headers=self.auth)
             self.assertEqual(response.status, 202, await response.text())
@@ -559,7 +573,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 "print": {"command": "push_status", "gcode_state": "RUNNING", "gcode_file": remote}})
             return {"result": "success"}
 
-        with mock.patch("bridge.server.PRINT_RETRY_DELAYS", (0.0, 0.0)), \
+        # The confirmation arrives after the first attempt gave up (0.05 s) and before the retry (0.3 s later).
+        with mock.patch("bridge.server.PRINT_RETRY_DELAYS", (0.3, 0.3)), \
                 mock.patch("bridge.server.START_CONFIRM_WAIT", 0.05), \
                 mock.patch("bridge.server.ftps.upload", self.uploader(uploads)), \
                 mock.patch("bridge.server.ftps.list_dir", self.card(uploads)), \
@@ -619,8 +634,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             # Only a German table here: ask in German (English requests fall back to English tables).
             status = await (await self.client.get("/api/status", headers={**self.auth, "Accept-Language": "de"})).json()
         self.assertTrue(status["connection"]["developer_mode"])
-        self.assertEqual(status["job"]["error"], {"code": "0300_400C", "value": 0x0300400C,
-                                                  "text": "Die Aufgabe wurde abgebrochen.", "internal": False})
+        self.assertEqual(status["job"]["error"], {"code": "0300_400C", "value": 0x0300400C, "actions": [],
+                                                  "acknowledge": True, "text": "Die Aufgabe wurde abgebrochen.",
+                                                  "internal": False})
         self.assertTrue(status["options"]["ams_backup"])
 
     async def test_developer_mode_off_refuses_commands(self):
@@ -654,6 +670,31 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.post("/api/control", json={"action": "clear_error"}, headers=self.auth)
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual(calls, [("print", "clean_print_error", 8.0), ("system", "uiop", 3)])
+
+    async def test_error_action(self):
+        self.printer.handle({"print": {"command": "push_status", "gcode_state": "PAUSE", "print_error": 0x07008011}})
+        status = await (await self.client.get("/api/status", headers=self.auth)).json()
+        self.assertEqual(status["job"]["error"]["actions"], ["resume_solved"])
+        calls = []
+
+        async def command(section, body, wait=8.0):
+            calls.append((section, body, wait))
+            return {"result": "success"}
+
+        with mock.patch.object(self.printer, "command", mock.AsyncMock(side_effect=command)):
+            response = await self.client.post("/api/control", headers=self.auth, json={
+                "action": "error_action", "value": {"code": "0700_8012", "action": "resume_solved"}})
+            self.assertEqual(response.status, 409)  # The printer shows another message now.
+            response = await self.client.post("/api/control", headers=self.auth, json={
+                "action": "error_action", "value": {"code": "0700_8011", "action": "stop"}})
+            self.assertEqual(response.status, 409)
+            self.assertEqual(calls, [])
+            response = await self.client.post("/api/control", headers=self.auth, json={
+                "action": "error_action", "value": {"code": "0700_8011", "action": "resume_solved"}})
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual([(section, body["command"], wait) for section, body, wait in calls],
+                         [("print", "resume", 8.0), ("system", "uiop", 3)])
+        self.assertEqual(calls[0][1]["err"], str(0x07008011))
 
     async def test_calibrate(self):
         self.printer.handle({"print": {"command": "push_status", "gcode_state": "IDLE"}})

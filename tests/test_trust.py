@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from bridge.trust import CertificateChanged, PrinterTrust, fingerprint
+from bridge.trust import CHANGED, CertificateChanged, PrinterTrust, fingerprint
 
 SERIAL = "01P00A000000000"
 
@@ -92,16 +92,23 @@ class TrustTests(unittest.IsolatedAsyncioTestCase):
     async def test_resumed_session_keeps_certificate_for_the_check(self):
         """FTPS data channel: a resumed control-channel session must still undergo certificate verification."""
         port, der, _ = await self.serve(SERIAL)
+        trust = PrinterTrust(SERIAL, fingerprint(der))
+        checked = []
+        verify = trust.verify
+        trust.verify = lambda seen: checked.append(seen) or verify(seen)
+        context = trust.context()
 
-        def two_connections():
-            trust = PrinterTrust(SERIAL, fingerprint(der))
-            context = trust.context()
+        def connect(session=None):
             with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
-                with context.wrap_socket(raw) as first:
-                    first.sendall(b"x")
-                    session = first.session
-            with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
-                with context.wrap_socket(raw, session=session) as second:
-                    return second.session_reused
+                with context.wrap_socket(raw, session=session) as tls:
+                    tls.sendall(b"x")
+                    return tls.session, tls.session_reused
 
-        self.assertTrue(await asyncio.to_thread(two_connections))
+        session, _ = await asyncio.to_thread(connect)
+        _, reused = await asyncio.to_thread(connect, session)
+        self.assertTrue(reused)
+        self.assertEqual(checked, [der, der])  # The resumed handshake presents the certificate and is checked.
+        trust.pin = "00" * 32
+        with self.assertRaises(CertificateChanged) as raised:
+            await asyncio.to_thread(connect, session)
+        self.assertIn(CHANGED, str(raised.exception))  # The pin decides, not a missing certificate.

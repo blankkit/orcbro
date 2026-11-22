@@ -156,9 +156,19 @@ def pack(value: Any) -> Any:
 
 
 def unpack(value: Any) -> Any:
+    """Decode `pack` output. Apply it only to fields the bridge itself writes (job errors, steps, warnings):
+    data from uploaded files can take the same shape. A message that cannot be formatted stays plain text."""
     if isinstance(value, dict):
         if set(value) == {"$message", "params"}:
-            return m(value["$message"], **unpack(value["params"]))
+            english, params = value["$message"], value["params"]
+            if not isinstance(english, str) or not isinstance(params, dict) or not all(
+                    isinstance(key, str) and key.isidentifier() for key in params):
+                raise ValueError("invalid message")
+            params = unpack(params)
+            try:
+                return m(english, **params)
+            except (KeyError, IndexError, ValueError, AttributeError, TypeError):
+                return english
         return {key: unpack(item) for key, item in value.items()}
     if isinstance(value, list):
         return [unpack(item) for item in value]

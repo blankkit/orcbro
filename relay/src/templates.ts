@@ -15,6 +15,15 @@ export function clean(value: unknown, limit: number): string | null {
   return text && text.length <= limit ? text : null;
 }
 
+/** Like `clean`, but shorten text over `limit` with an ellipsis (as the bridge does) instead of rejecting it. */
+export function shorten(value: unknown, limit: number): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ").replace(/\s+/g, " ").trim();
+  const chars = [...text];
+  if (!chars.length) return null;
+  return chars.length <= limit ? text : chars.slice(0, limit - 1).join("").trimEnd() + "\u2026";
+}
+
 export function startAlert(job: string, printer: string, language: Language = "en") {
   return language === "de"
     ? { title: "Druck gestartet", body: `${job} auf ${printer}` }

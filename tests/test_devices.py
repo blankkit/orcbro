@@ -214,7 +214,7 @@ class PrinterApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((data["printer"]["id"], data["connection"]["connected"]), (SECOND, False))
         _, data = await self.call("GET", f"/api/printers/{FIRST}/status")
         self.assertEqual((data["printer"]["id"], data["printer"]["name"]), (FIRST, "Werkstatt"))
-        _, data = await self.call("GET", "/api/status")  # Older app uses the default printer.
+        _, data = await self.call("GET", "/api/status")  # Without a printer in the path: the default printer.
         self.assertEqual(data["printer"]["id"], FIRST)
         status, _ = await self.call("GET", "/api/printers/UNBEKANNT/status")
         self.assertEqual(status, 404)
@@ -300,6 +300,24 @@ class PrinterApiTests(unittest.IsolatedAsyncioTestCase):
         _, data = await self.call("GET", "/api/printers")
         self.assertEqual([p["id"] for p in data["printers"]], [FIRST])
         self.assertEqual(json.loads(Path(self.tmp.name, "printers.json").read_text())["printers"], [])
+
+    async def test_remove_ends_the_live_activity_and_unloads_spools(self):
+        from bridge.server import DEVICES, PUSH, SPOOLS
+        from test_live import FakeAPNs, status as live_status
+        await self.add_second()
+        app = self.client.server.app
+        live = app[DEVICES].devices[SECOND].live
+        live.client = apns = FakeAPNs()
+        await live.process(live_status(state="RUNNING", progress=30), now=1000)
+        app[PUSH].add("update", "bb" * 32, "production", "act-1", SECOND)
+        app[SPOOLS].load(SECOND, 0, "04A1B2C3", weight=1000)
+        app[SPOOLS].load(FIRST, 1, "04A1B2C4", weight=1000)
+        status, _ = await self.call("DELETE", f"/api/printers/{SECOND}")
+        self.assertEqual(status, 200)
+        self.assertEqual(apns.events("bb" * 32), [("end", 10)])
+        self.assertNotIn(SECOND, app[PUSH].printers)
+        self.assertIsNone(app[SPOOLS].at(SECOND, 0))
+        self.assertEqual(app[SPOOLS].at(FIRST, 1)["id"], "04A1B2C4")
 
     async def test_needs_login(self):
         response = await self.client.get("/api/printers")

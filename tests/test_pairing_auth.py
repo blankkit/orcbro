@@ -97,7 +97,10 @@ class PairingStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await store.remove(first.id))
         with self.assertRaises(InvalidCode):
             await store.pair(invitation.code, "Ohne Einlader")
-        self.assertIsNotNone(store.setup_code)
+        # Removing the last device does not reopen pairing; only a restart issues a new setup code.
+        self.assertIsNone(store.setup_code)
+        self.assertFalse(store.setup_open)
+        self.assertIsNotNone(self.store().setup_code)
 
     async def test_legacy_principal_can_invite_and_has_no_current_device(self):
         secret = "s3cret-bridge-access-token"

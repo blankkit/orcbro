@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { authenticate, BIND_SECONDS, claim, issue } from "../src/bridges.ts";
+import { authenticate, BIND_SECONDS, claim, identify, issue } from "../src/bridges.ts";
 import worker from "../src/index.ts";
 import { forgetProviderToken, providerToken, WINDOW_SECONDS } from "../src/jwt.ts";
 import { alert, type Language, type Template } from "../src/templates.ts";
-import { readLimited, validate, validateNotification } from "../src/validate.ts";
+import { CLOCK_SKEW_SECONDS, readLimited, validate, validateNotification } from "../src/validate.ts";
 
 const TOKEN = "ab".repeat(40);
-const update = { aps: { timestamp: 1, event: "update", "content-state": { phase: "RUNNING", jobName: "Lid", progress: 3 } } };
+const NOW = Math.floor(Date.now() / 1000);
+const update = { aps: { timestamp: NOW, event: "update", "content-state": { phase: "RUNNING", jobName: "Lid", progress: 3 } } };
 
 test("accepts only Live Activity pushes in the bridge format", () => {
   const ok = validate({ token: TOKEN.toUpperCase(), environment: "production", priority: 10, payload: update });
@@ -33,6 +34,49 @@ test("accepts only Live Activity pushes in the bridge format", () => {
     { token: TOKEN, environment: "production", payload: { aps: { ...update.aps, "content-state": { name: "x".repeat(5000) } } } },
   ];
   for (const input of refused) assert.ok("error" in validate(input), JSON.stringify(input).slice(0, 80));
+});
+
+test("Live Activity payloads are rebuilt from known fields with bounded texts and dates", () => {
+  const state = { phase: "RUNNING", jobName: `Lid\n${"x".repeat(200)}`, progress: 140.4, layer: 3, totalLayers: null,
+                  remainingMinutes: 20, finishAt: NOW + 1200.6, stage: null, error: "Nozzle clog.", secret: "drop me" };
+  const checked = validate({ token: TOKEN, environment: "production", payload: { aps: {
+    timestamp: NOW, event: "update", "content-state": state, "stale-date": NOW + 10 * 86400, "dismissal-date": NOW,
+    "relevance-score": 100, "input-push-token": 1 } } });
+  assert.ok(!("error" in checked), JSON.stringify(checked));
+  const aps = JSON.parse(checked.body).aps;
+  assert.deepEqual(Object.keys(aps).sort(), ["content-state", "event", "stale-date", "timestamp"]);
+  assert.equal(aps["stale-date"], NOW + 86400);  // At most a day after the timestamp.
+  const content = aps["content-state"];
+  assert.equal(content.jobName.length, 120);
+  assert.ok(content.jobName.startsWith("Lid x") && content.jobName.endsWith("\u2026"));
+  assert.deepEqual({ ...content, jobName: undefined }, { jobName: undefined, phase: "RUNNING", progress: 100, layer: 3,
+    totalLayers: null, remainingMinutes: 20, finishAt: NOW + 1201, stage: null, error: "Nozzle clog." });
+  // Keys the bridge leaves out stay out, as before.
+  assert.deepEqual(JSON.parse((validate({ token: TOKEN, environment: "production", payload: update }) as { body: string }).body), update);
+  const end = validate({ token: TOKEN, environment: "production", payload: { aps: { ...update.aps, event: "end",
+    "dismissal-date": NOW + 30 * 86400 } } });
+  assert.equal(JSON.parse((end as { body: string }).body).aps["dismissal-date"], NOW + 4 * 3600);
+  const far = validate({ token: TOKEN, environment: "production", payload: { aps: { ...update.aps,
+    "content-state": { ...update.aps["content-state"], finishAt: NOW + 365 * 86400 } } } });
+  assert.equal(JSON.parse((far as { body: string }).body).aps["content-state"].finishAt, null);
+  const start = validate({ token: TOKEN, environment: "production", payload: { aps: { ...update.aps, event: "start",
+    "attributes-type": "PrintActivityAttributes", attributes: { printerName: "P1S", printerId: "p0123456789abcdef", extra: 1 } } } });
+  assert.deepEqual(JSON.parse((start as { body: string }).body).aps.attributes, { printerName: "P1S", printerId: "p0123456789abcdef" });
+  const refused = [
+    { ...update.aps, timestamp: NOW - CLOCK_SKEW_SECONDS - 10 },
+    { ...update.aps, timestamp: NOW + CLOCK_SKEW_SECONDS + 10 },
+    { ...update.aps, timestamp: "now" },
+    { ...update.aps, "stale-date": "later" },
+    { ...update.aps, "content-state": { ...update.aps["content-state"], phase: "<b>done</b>" } },
+    { ...update.aps, "content-state": { ...update.aps["content-state"], progress: "3" } },
+    { ...update.aps, "content-state": { ...update.aps["content-state"], layer: "3" } },
+    { ...update.aps, "content-state": { ...update.aps["content-state"], error: { text: "x" } } },
+    { ...update.aps, "content-state": { ...update.aps["content-state"], jobName: " \n " } },
+    { ...update.aps, event: "start", "attributes-type": "PrintActivityAttributes", attributes: { printerName: "P1S", printerId: "01P00A" } },
+  ];
+  for (const aps of refused) {
+    assert.ok("error" in validate({ token: TOKEN, environment: "production", payload: { aps } }), JSON.stringify(aps).slice(0, 120));
+  }
 });
 
 test("Live Activity start alerts use English by default and accept English or German", () => {
@@ -86,12 +130,99 @@ class MemoryStore {
   }
 }
 
-function env(pem: string | undefined, allow = true, store = new MemoryStore()) {
+class CountingLimit {
+  keys: string[] = [];
+  allow: boolean;
+  constructor(allow = true) {
+    this.allow = allow;
+  }
+  async limit({ key }: { key: string }) {
+    this.keys.push(key);
+    return { success: this.allow };
+  }
+}
+
+function env(pem: string | undefined, allow = true, store = new MemoryStore(), device = new CountingLimit(allow)) {
   const limiter = { limit: async () => ({ success: allow }) };
   return { APNS_KEY: pem, APNS_KEY_ID: "KEYID12345", APNS_TEAM_ID: "TEAMID1234", BUNDLE_ID: "it.example.app",
-           RELAY_SECRET: pem ? SECRET : undefined, TOKENS: store,
-           DEVICE_LIMIT: limiter, SENDER_LIMIT: limiter, REGISTER_LIMIT: limiter };
+           RELAY_SECRET: pem ? SECRET : undefined, RELAY_SECRET_PREVIOUS: undefined as string | undefined, TOKENS: store,
+           DEVICE_LIMIT: device, SENDER_LIMIT: limiter, REGISTER_LIMIT: limiter };
 }
+
+async function withAPNs<T>(run: (calls: { url: string; init: RequestInit }[]) => Promise<T>): Promise<T> {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return new Response(null, { status: 200 });
+  }) as typeof fetch;
+  try {
+    return await run(calls);
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test("another bridge's requests for a bound token do not use up the device's allowance", async () => {
+  const { pem } = await testKey();
+  const owner = await issue(SECRET);
+  const intruder = await issue(SECRET);
+  const store = new MemoryStore();
+  const device = new CountingLimit();
+  const environment = env(pem, true, store, device);
+  await withAPNs(async (calls) => {
+    const body = { token: TOKEN, environment: "production", payload: update };
+    assert.equal((await worker.fetch(post(body, "/v1/live-activity", `${owner.bridge}.${owner.key}`), environment)).status, 200);
+    assert.equal(device.keys.length, 1);
+    for (let i = 0; i < 5; i++) {
+      const refused = await worker.fetch(post(body, "/v1/live-activity", `${intruder.bridge}.${intruder.key}`), environment);
+      assert.equal(refused.status, 403);
+    }
+    assert.equal(device.keys.length, 1);
+    assert.equal(calls.length, 1);
+  });
+});
+
+test("a bridge with a key from the previous secret keeps its ID and receives the new key", async () => {
+  const { pem } = await testKey();
+  const old = await issue("old-secret");
+  const store = new MemoryStore();
+  await claim(store, TOKEN, old.bridge);
+  const environment = { ...env(pem, true, store), RELAY_SECRET_PREVIOUS: "old-secret" };
+  await withAPNs(async (calls) => {
+    const body = { token: TOKEN, environment: "production", payload: update };
+    const response = await worker.fetch(post(body, "/v1/live-activity", `${old.bridge}.${old.key}`), environment);
+    assert.equal(response.status, 200);  // Still the token's bridge: no TokenBoundElsewhere.
+    const renewed = response.headers.get("x-bridge-key");
+    assert.equal(await authenticate(`Bearer ${old.bridge}.${renewed}`, SECRET), old.bridge);
+    const next = await worker.fetch(post(body, "/v1/live-activity", `${old.bridge}.${renewed}`), environment);
+    assert.equal(next.status, 200);
+    assert.equal(next.headers.get("x-bridge-key"), null);
+    assert.equal(calls.length, 2);
+    const after = await worker.fetch(post(body, "/v1/live-activity", `${old.bridge}.${old.key}`), env(pem, true, store));
+    assert.equal(after.status, 401);  // Once the previous secret is gone, the old key stops working.
+  });
+});
+
+test("notifications with an event ID are delivered once per token", async () => {
+  const { pem } = await testKey();
+  const issued = await issue(SECRET);
+  const auth = `${issued.bridge}.${issued.key}`;
+  const environment = env(pem);
+  await withAPNs(async (calls) => {
+    const note = { token: TOKEN, environment: "production", template: "finished", job: "Lid", printer: "P1S",
+                   id: "evt-0123456789" };
+    assert.deepEqual(await (await worker.fetch(post(note, "/v1/notification", auth), environment)).json(), { ok: true });
+    assert.deepEqual(await (await worker.fetch(post(note, "/v1/notification", auth), environment)).json(),
+                     { ok: true, duplicate: true });
+    assert.equal(calls.length, 1);
+    await worker.fetch(post({ ...note, token: "cd".repeat(40) }, "/v1/notification", auth), environment);
+    await worker.fetch(post({ ...note, id: undefined }, "/v1/notification", auth), environment);
+    await worker.fetch(post({ ...note, id: undefined }, "/v1/notification", auth), environment);
+    assert.equal(calls.length, 4);  // Another phone, and notifications without an ID, are not deduplicated.
+    assert.equal((await worker.fetch(post({ ...note, id: "x" }, "/v1/notification", auth), environment)).status, 422);
+  });
+});
 
 let credentials = "";
 const post = (body: unknown, path = "/v1/live-activity", auth: string | null = credentials) => new Request(`https://relay.example${path}`,
@@ -107,6 +238,30 @@ test("bridge keys are issued and verified without stored state", async () => {
   assert.equal(await authenticate(`Bearer ${other.bridge}.${issued.key}`, SECRET), null);
   assert.equal(await authenticate(null, SECRET), null);
   assert.equal(await authenticate("Bearer broken", SECRET), null);
+});
+
+test("keys made with the previous secret keep working while it rotates, and get the new key", async () => {
+  const issued = await issue("old-secret");
+  const header = `Bearer ${issued.bridge}.${issued.key}`;
+  assert.equal(await identify(header, SECRET), null);
+  const renewed = await identify(header, SECRET, "old-secret");
+  assert.equal(renewed?.bridge, issued.bridge);
+  assert.equal(await authenticate(`Bearer ${issued.bridge}.${renewed?.renewed}`, SECRET), issued.bridge);
+  const current = await issue(SECRET);
+  assert.deepEqual(await identify(`Bearer ${current.bridge}.${current.key}`, SECRET, "old-secret"),
+                   { bridge: current.bridge, renewed: null });
+});
+
+test("a first claim counts only if KV kept it", async () => {
+  const store = new MemoryStore();
+  const original = store.put.bind(store);
+  // Another bridge claims the same token at the same moment, and its write wins.
+  store.put = async (key, value, options) => {
+    await original(key, value, options);
+    store.entries.set(key, { value: "b".repeat(32), metadata: { at: 1000 } });
+  };
+  assert.ok(!(await claim(store, TOKEN, "a".repeat(32), 1000)));
+  assert.ok(await claim(new MemoryStore(), TOKEN, "a".repeat(32), 1000));
 });
 
 test("token belongs to the first bridge; binding refreshes infrequently and expires", async () => {

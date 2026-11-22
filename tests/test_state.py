@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from bridge.state import EXTERNAL_SLOT, fan_percent, hms_code, humidity_letter, merge, normalize
+from bridge.state import EXTERNAL_SLOT, STAGES, fan_percent, hms_code, humidity_letter, merge, normalize
 from helpers import load
 
 PRINTER = {"name": "Test", "serial": "01P00A000000000", "model": "Bambu Lab P1S", "firmware": "01.10.00.00"}
@@ -61,6 +61,27 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(status["ams"]["active_slot"], 2)
         self.assertEqual(status["ams"]["external"]["slot"], EXTERNAL_SLOT)
         self.assertEqual(status["temperatures"]["nozzle"], 49.125)
+        self.assertIsNone(status["ams"]["change"])  # `ams_status` 768: the AMS is not changing filament.
+
+    def test_filament_change(self):
+        raw = raw_state()
+        # Loading A2 (`tray_tar`) while A3 is still in the toolhead; then unloading (255).
+        merge(raw, {"ams_status": 0x0103, "ams": {"tray_now": "2", "tray_tar": "1"}})
+        status = normalize(raw, connected=True, last_message_at=1.0, printer=PRINTER)
+        self.assertEqual(status["ams"]["change"], {"target": 1})
+        self.assertEqual(status["ams"]["active_slot"], 2)
+        merge(raw, {"ams": {"tray_tar": "255"}})
+        self.assertEqual(normalize(raw, connected=True, last_message_at=1.0, printer=PRINTER)["ams"]["change"],
+                         {"target": None})
+        merge(raw, {"ams": {"tray_tar": "254"}})
+        self.assertEqual(normalize(raw, connected=True, last_message_at=1.0, printer=PRINTER)["ams"]["change"],
+                         {"target": EXTERNAL_SLOT})
+        # Dual nozzles: the active extruder's `star`, like `snow` (AMS 1 slot 2 → B3 is ams 1, tray 2).
+        merge(raw, {"device": {"extruder": {"state": 0x10, "info": [{"id": 1, "snow": 0xFFFF, "star": 0x0102}]}}})
+        self.assertEqual(normalize(raw, connected=True, last_message_at=1.0, printer=PRINTER)["ams"]["change"],
+                         {"target": 6})
+        merge(raw, {"ams_status": 0x0300})
+        self.assertIsNone(normalize(raw, connected=True, last_message_at=1.0, printer=PRINTER)["ams"]["change"])
 
     def test_running_job(self):
         raw = raw_state()
@@ -104,10 +125,6 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(hms_code({"attr": "x"}))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PrinterFlagTests(unittest.TestCase):
     def status(self, **fields):
         raw = raw_state()
@@ -146,8 +163,18 @@ class PrinterFlagTests(unittest.TestCase):
     def test_print_error_code(self):
         self.assertIsNone(self.status()["job"]["error"])
         job = self.status(print_error=0x0300400C)["job"]
-        self.assertEqual(job["error"], {"code": "0300_400C", "value": 0x0300400C})
+        self.assertEqual(job["error"], {"code": "0300_400C", "value": 0x0300400C, "actions": [], "acknowledge": True})
         self.assertEqual(job["subtask_id"], "0")
+        self.assertIsNone(job["job_id"])
+        self.assertEqual(self.status(job_id=123456)["job"]["job_id"], "123456")
+
+    def test_newer_stage_texts(self):
+        job = self.status(gcode_state="PREPARE", stg=[58, 50, 77], stg_cur=58)["job"]
+        self.assertEqual(job["stage"], 'Thermal preconditioning for the first layer')
+        self.assertEqual([s["text"] for s in job["stages"]], ['Thermal preconditioning for the first layer',
+                                                            'Adjusting the bed temperature', 'Preparing the AMS'])
+        self.assertTrue(all(STAGES.get(code) for code in range(78)))
+
 
     def test_options(self):
         # Real P1S flags: backup/remainder on, recovery off, RFID only on insertion.
@@ -162,6 +189,56 @@ class PrinterFlagTests(unittest.TestCase):
         self.assertEqual(without_ams, {"auto_recovery": True, "ams_backup": None, "rfid_on_startup": None,
                                        "rfid_on_insert": None, "remain_estimate": None})
 
+
+class RecoveryActionTests(unittest.TestCase):
+    """Buttons of Bambu Studio's error dialog per message code (Bambu Lab's HMS action table)."""
+
+    def error(self, value, printer=PRINTER, **fields):
+        raw = raw_state()
+        merge(raw, {"print_error": value, **fields})
+        return normalize(raw, connected=True, last_message_at=1.0, printer=printer)["job"]["error"]
+
+    def test_table_actions(self):
+        # AMS runout while printing: the printer waits for "Resume (problem solved)".
+        self.assertEqual(self.error(0x07008011, gcode_state="PAUSE"),
+                         {"code": "0700_8011", "value": 0x07008011, "actions": ["resume_solved"], "acknowledge": True})
+        # Filament stuck in the PTFE tube: "Finished, Continue" repeats the AMS step.
+        self.assertEqual(self.error(0x07008006, gcode_state="PAUSE")["actions"], ["continue"])
+        # External spool: did filament come out of the nozzle?
+        self.assertEqual(self.error(0x07FF8007, gcode_state="PAUSE")["actions"], ["extruded", "retry_extrusion"])
+        # Printer-specific table: the H3C retries instead.
+        self.assertEqual(self.error(0x07FF8007, printer={"model": "Bambu Lab H3C", "model_id": "N10"})["actions"],
+                         ["retry"])
+        # Bambu Studio's own Retry codes.
+        self.assertEqual(self.error(0x07018004)["actions"], ["retry"])
+        # Unknown codes keep acknowledging only.
+        self.assertEqual(self.error(0x0300400C)["actions"], [])
+
+    def test_table_holds_only_buttons_the_bridge_sends(self):
+        from bridge import recovery
+        tables = [recovery.TABLE["codes"], *recovery.TABLE["models"].values()]
+        self.assertGreater(len(recovery.TABLE["codes"]), 500)
+        for table in tables:
+            for code, buttons in table.items():
+                self.assertRegex(code, r"^[0-9A-F]{8}$")
+                self.assertTrue(set(buttons) - {recovery.NO_CLOSE}, code)
+                self.assertLessEqual(set(buttons), set(recovery.BUTTONS) | {recovery.NO_CLOSE}, code)
+        for action in set(recovery.BUTTONS.values()):
+            recovery.command(action, 0x07008011, "")
+
+    def test_required_choice_hides_acknowledge(self):
+        # Power loss: resume or stop; Bambu's dialog has no close button.
+        error = self.error(0x03008007, gcode_state="PAUSE")
+        self.assertEqual((error["actions"], error["acknowledge"]), (["resume", "stop"], False))
+
+    def test_abort_for_a_failed_filament_change_without_print(self):
+        # P1S `flag3` reports filament change abort (bit 13); `ams_status` 0x0103 = filament change.
+        idle = self.error(0x07008006, gcode_state="IDLE", ams_status=0x0103)
+        self.assertEqual(idle["actions"], ["continue", "abort"])
+        self.assertEqual(self.error(0x07008006, gcode_state="PAUSE", ams_status=0x0103)["actions"], ["continue"])
+        self.assertEqual(self.error(0x07008006, gcode_state="IDLE", ams_status=0x0300)["actions"], ["continue"])
+        self.assertEqual(self.error(0x07008006, gcode_state="IDLE", ams_status=0x0103, flag3=0x10)["actions"],
+                         ["continue"])
 
 class BareTrayTests(unittest.TestCase):
     """The P1 series reports a removed spool as a bare `{"id": n}`; the old fields must not linger."""
@@ -187,6 +264,15 @@ class BareTrayTests(unittest.TestCase):
         self.assertIsNotNone(trays[1]["material"])
         self.assertFalse(trays[2]["present"])
 
+    def test_bare_external_spool_replaces_the_old_one(self):
+        raw = {"ams": {"vir_slot": [{"id": "254", "tray_type": "TPU", "tray_color": "FFFFFFFF"},
+                                    {"id": "255", "tray_type": "PETG", "tray_color": "000000FF"}]}}
+        merge(raw, {"ams": {"vir_slot": [{"id": "254"}]}})
+        self.assertEqual(raw["ams"]["vir_slot"], [{"id": "254"}, {"id": "255", "tray_type": "PETG",
+                                                                  "tray_color": "000000FF"}])
+        externals = normalize(raw, connected=True, last_message_at=1, printer={"model_id": "O1D"})["ams"]["externals"]
+        self.assertEqual([(t["slot"], t["empty"]) for t in externals], [(254, True), (255, False)])
+
     def test_multicolor_slot(self):
         from bridge.printer import Printer
         printer = Printer("h", "s", "c")
@@ -199,3 +285,7 @@ class BareTrayTests(unittest.TestCase):
         self.assertEqual(trays[0]["colors"], ["#E94B3CFF", "#FFFFFFFF"])
         self.assertTrue(trays[0]["gradient"])
         self.assertFalse(trays[1]["gradient"])
+
+
+if __name__ == "__main__":
+    unittest.main()

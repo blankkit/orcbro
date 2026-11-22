@@ -28,7 +28,8 @@ class PublicOrigin:
     include_fingerprint: bool
 
 
-def _trusted(peer: str | None, networks: tuple[str, ...]) -> bool:
+def trusted_proxy(peer: str | None, networks: tuple[str, ...]) -> bool:
+    """Is `peer` inside one of the `BRIDGE_TRUSTED_PROXIES` networks (addresses or CIDRs)?"""
     if not peer:
         return False
     try:
@@ -61,7 +62,7 @@ def public_origin(*, request_host: str, peer: str | None, forwarded_proto: str |
     if public_url:
         return PublicOrigin(public_url.rstrip("/"), False)
     hostname = _request_hostname(request_host)
-    if _trusted(peer, trusted_proxies) and forwarded_proto and forwarded_proto.lower() == "https":
+    if trusted_proxy(peer, trusted_proxies) and forwarded_proto and forwarded_proto.lower() == "https":
         # The proxy must forward the external Host header unchanged.
         parsed = urlsplit(f"//{request_host}")
         port = f":{parsed.port}" if parsed.port and parsed.port != 443 else ""
@@ -110,11 +111,6 @@ button,.button{display:block;width:100%;font-family:inherit;font-size:1.05rem;fo
 border:0;border-radius:999px;padding:1rem;margin-top:.9rem;text-align:center;text-decoration:none;cursor:pointer}
 .secondary{background:var(--face);color:var(--text)}
 .error{color:var(--error);font-weight:600}
-ul.printers{list-style:none;margin:0;padding:0}
-ul.printers li{display:flex;align-items:center;gap:.75rem;padding:.7rem 0;border-top:.5px solid var(--edge)}
-ul.printers li:first-child{border-top:0}
-.dot{width:.6rem;height:.6rem;border-radius:50%;background:var(--muted);flex:none}.dot.on{background:var(--ok)}
-.name{font-weight:600}.grow{flex:1;min-width:0}
 code{font:.8rem ui-monospace,"SF Mono",Menlo,monospace;overflow-wrap:anywhere;color:var(--muted)}
 a{color:var(--accent)}
 """
@@ -153,9 +149,19 @@ def invite_form(error: str | None = None) -> str:
             f'<p class="muted small">{_key_source()}</p></section>')
 
 
-def invitation_page(*, identity, link: str, code: str, minutes: int) -> str:
+def setup_form(error: str | None = None) -> str:
+    """Setup-code form for the first device, offered only over HTTPS: the code itself never appears on the page."""
+    message = f'<p class="error">{html.escape(render(error))}</p>' if error else ""
+    return (f'<section class="card"><p class="label">{t("QR Code")}</p>'
+            f'<p>{t("Enter the setup code to show a QR code for Bambro.")}</p>' + message +
+            f'<form method="post" action="/setup"><label for="code">{t("Setup Code")}</label>'
+            '<input id="code" name="code" autocomplete="one-time-code" autocapitalize="characters" required>'
+            f'<button type="submit">{t("Show QR Code")}</button></form></section>')
+
+
+def invitation_page(*, identity, link: str, code: str, minutes: int, label: str | None = None) -> str:
     body = (_header(identity) +
-            f'<section class="card"><p class="label">{t("Invitation")}</p>'
+            f'<section class="card"><p class="label">{html.escape(label or t("Invitation"))}</p>'
             f'<p>{t("Valid for {p0} minutes, for one device.", p0=minutes)}</p>{_qr(link)}'
             f'<p class="code">{html.escape(display_code(code))}</p>'
             f'<p class="muted small" style="text-align:center">{t("Enter this code if the QR code does not work.")}</p>'
@@ -163,43 +169,38 @@ def invitation_page(*, identity, link: str, code: str, minutes: int) -> str:
     return _document(identity.name, body)
 
 
-def setup_page(*, identity, printers: list[dict], setup_code: str | None,
-               origin: PublicOrigin | None, fingerprint: str | None, fixed_key: bool,
-               can_invite: bool = False, invite_error: str | None = None) -> str:
-    printer_items = "".join(
-        '<li><span class="dot{}"></span><span class="grow"><span class="name">{}</span><br>'
-        '<span class="muted small">{}</span></span><span class="muted small">{}</span></li>'.format(
-            " on" if printer.get("connected") else "",
-            html.escape(str(printer.get("name") or "Bambu Lab")),
-            html.escape(str(printer.get("model") or t("model unknown"))),
-            t("connected") if printer.get("connected") else t("not connected"))
-        for printer in printers)
-    printer_section = (f'<ul class="printers">{printer_items}</ul>' if printer_items
-                       else f'<p class="muted">{t("No printer configured yet. Set one up in Bambro after pairing.")}</p>')
+def setup_page(*, identity, origin: PublicOrigin | None, fixed_key: bool, paired: bool,
+               setup_minutes: int | None, secure: bool = False, error: str | None = None) -> str:
+    """Public page: how to pair, without codes, fingerprints or printers. `setup_minutes` is the remaining
+    validity of the first-device setup code (None if there is none); `secure` = request arrived over HTTPS."""
     if fixed_key:
         pairing = (f'<section class="card"><p class="label">{t("Pair")}</p>'
                    f'<p>{t("A fixed access key is configured. New devices can pair with this key or an invitation.")}</p>')
-        if can_invite:
-            pairing += "</section>" + invite_form(invite_error)
+        if secure and origin:
+            pairing += "</section>" + invite_form(error)
         elif origin:
             pairing += (f'<p>{t("QR code invitations are available at the HTTPS address.")}</p>'
                         f'<a class="button" href="{html.escape(origin.url, quote=True)}/">{html.escape(origin.url)}</a>'
                         '</section>')
         else:
             pairing += f'<p class="muted small">{_key_source()}</p></section>'
-    elif setup_code and origin:
-        link = pairing_url(origin, setup_code, identity.name, fingerprint)
+    elif setup_minutes:
         pairing = (f'<section class="card"><p class="label">{t("Pair Bambro")}</p>'
-                   f'<p>{t("One-time setup code for the first device.")}</p>' + _qr(link) +
-                   f'<p class="code">{display_code(setup_code)}</p>'
-                   f'<p class="muted small" style="text-align:center">{t("Certificate Fingerprint")}<br>'
-                   f'<code>{html.escape(fingerprint or t("not applicable"))}</code></p></section>')
-    elif setup_code:
+                   f'<p>{t("The setup code for the first device is in the bridge log, for example <code>docker compose logs orcbro</code>. It is valid for {p0} more minutes; restarting the bridge issues a new one.", p0=setup_minutes)}</p>'
+                   f'<p>{t("In Bambro, choose this bridge from the bridges found on your network, or enter its address, then type the setup code.")}</p>')
+        if secure and origin:
+            pairing += "</section>" + setup_form(error)
+        elif origin:
+            pairing += (f'<p>{t("To pair with a QR code instead, open the HTTPS address.")}</p>'
+                        f'<a class="button" href="{html.escape(origin.url, quote=True)}/">{html.escape(origin.url)}</a>'
+                        '</section>')
+        else:
+            pairing += (f'<p>{t("Pairing requires HTTPS. Enable <code>BRIDGE_TLS</code> or set <code>BRIDGE_PUBLIC_URL</code> to the external HTTPS address.")}</p>'
+                        '</section>')
+    elif not paired:
         pairing = (f'<section class="card"><p class="label">{t("Pair Bambro")}</p>'
-                   f'<p>{t("Pairing requires HTTPS. Enable <code>BRIDGE_TLS</code> or set <code>BRIDGE_PUBLIC_URL</code> to the external HTTPS address.")}</p></section>')
+                   f'<p>{t("Pairing is closed: the setup code has expired or the last device was removed. Restart the bridge to get a new setup code in its log.")}</p></section>')
     else:
         pairing = (f'<section class="card"><p class="label">{t("More Devices")}</p>'
                    f'<p>{t("Invite more iPhones in Bambro on an already paired device: Settings → Bridge → Devices → Pair Another Device. The QR code for the new device appears there.")}</p></section>')
-    body = (_header(identity) + pairing +
-            f'<section class="card"><p class="label">{t("Printer")}</p>{printer_section}</section>')
-    return _document(identity.name, body)
+    return _document(identity.name, _header(identity) + pairing)

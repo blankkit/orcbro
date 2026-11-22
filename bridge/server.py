@@ -1,20 +1,21 @@
-"""Bridge HTTP API for the OrcaIOs app (JSON, Server-Sent Events, MJPEG).
+"""Bridge HTTP API (Brotocol) for the Bambro app: JSON, Server-Sent Events and MJPEG; see `docs/reference.md`.
 
-Printer routes live under `/api/printers/<serial>/…` (status, controls, AMS, SD card, camera, profiles).
-The same paths without the printer prefix (`/api/status`, etc.) use the default printer for older apps.
-Jobs (`/api/jobs`) are shared across printers; each job belongs to one printer (`printer`).
+Printer routes live under `/api/printers/<serial>/…` (status, controls, AMS, SD card, camera, profiles). The same
+paths without the printer prefix (`/api/status`, etc.) address the default printer; Bambro uses them while no
+printer is selected. Jobs (`/api/jobs`) are shared across printers; each job belongs to one printer (`printer`).
 
-Authentication: the app exchanges the access key (`BRIDGE_ACCESS_TOKEN`) for an app token once
-(`POST /api/pair`), then sends `Authorization: Bearer <token>`. The HMAC-derived legacy token survives
-restarts and is revoked by changing the key."""
+Authentication: a device pairs once (`POST /api/pair`) with the setup code from the log, an invitation from a
+paired device, or the fixed access key (`BRIDGE_ACCESS_TOKEN`), and then sends `Authorization: Bearer <token>`.
+Device tokens are random and can be revoked one by one (`auth.py`); the token for the fixed key is derived from
+the key (HMAC), survives restarts and is revoked by changing the key. The setup page and its forms (`/`,
+`/setup`, `/invite`) are served by `web.py`."""
 from __future__ import annotations
 
-from .i18n import m, message_of, render, language_middleware
+from .i18n import m, message_of, render, language_middleware, t
 
 import asyncio
 import contextlib
 import hashlib
-import hmac
 import ipaddress
 import json
 import logging
@@ -23,7 +24,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from aiohttp import web
@@ -31,37 +32,36 @@ from aiohttp import web
 from . import __version__, controls, ftps, preview
 from .apns import APNsClient, APNsConfig
 from .relay import RelayClient
-from .branding import LEGACY_TOKEN_CONTEXT
-from .auth import AuthError, InvalidCode, PairingStore, Principal, RateLimited, display_code
+from .auth import AuthError, InvalidCode, PairingStore, Principal, RateLimited, display_code, legacy_app_token
 from .camera import Camera
 from .config import Config
 from .devices import Catalogs, Device, Devices, PrinterSettings, PrinterStore
 from .hms import Texts
 from .identity import BridgeIdentity, load_identity
 from .models import DUAL_NOZZLE_MODELS, LEGACY_MODELS, Models
-from .probe import ProbeError, probe, read_serial
+from .probe import ProbeError, probe, read_identity
 from .live import ENVIRONMENTS, SHARED_DEVICE, LiveActivities, Registry, public_printer_id
-from .spools import Plan, SpoolStore, SpoolTracker
+from .spools import TAG_FIELDS, BambuAmount, Plan, SpoolStore, SpoolTracker, trays_of
 from .notify import EVENTS as NOTIFY_EVENTS
 from .mdns import MDNSAdvertiser
+from .newspool import NewSpoolWatcher
 from .jobs import (Job, JobError, JobStore, check_complete, classify, open_archive, plate_thumbnail, project_filaments,
-                   project_plates, project_printer, read_member, read_objects, read_slice_info, remote_name)
+                   project_plates, project_printer, read_member, read_objects, read_slice_info, remote_name,
+                   sliced_for)
 from .printer import Printer, PrinterError
 from .print_command import build_project_file
 from .print_metadata import read_print_metadata
 from .profiles import BED_LABELS, BED_TYPES, SUPPORT_TYPES, Catalog, ProfileError
 from .slicer import SliceError, Slicer
-from .state import EXTERNAL_SLOT, model_id_from_name
+from .state import EXTERNAL_SLOT, MODEL_IDS_BY_NAME, model_id_from_name
 from .tls import TLSState
-from .web import PublicOrigin, URLConfigurationError, invitation_page, pairing_url, public_origin, setup_page
+from .web import (PublicOrigin, URLConfigurationError, invitation_page, pairing_url, public_origin, setup_page,
+                  trusted_proxy)
 
 log = logging.getLogger(__name__)
 
-IDLE_STATES = controls.IDLE
-
-
-def app_token(secret: str) -> str:
-    return hmac.new(secret.encode(), LEGACY_TOKEN_CONTEXT, hashlib.sha256).hexdigest()
+# App token for the fixed access key (`POST /api/pair` with `token`).
+app_token = legacy_app_token
 
 
 def error(status: int, message: str) -> web.Response:
@@ -136,16 +136,23 @@ def device(request: web.Request) -> Device:
 
 
 def job_device(app: web.Application, job: Job) -> Device:
-    """Job printer; older jobs without a printer belong to the default printer."""
+    """The job's printer."""
     devices = app[DEVICES]
-    if job.printer and job.printer in devices.devices:
+    if job.printer in devices.devices:
         return devices.get(job.printer)
-    if job.printer:
-        raise Problem(409, m('The printer for this job is no longer configured.'))
-    found = devices.default()
-    if found is None:
-        raise Problem(409, m('No printer configured yet.'))
-    return found
+    raise Problem(409, m('The printer for this job is no longer configured.'))
+
+
+def assign_unowned_jobs(app: web.Application) -> None:
+    """Jobs saved by 0.x bridges, before printers were configurable, have no printer: they belong to the default
+    printer. Record it once, as soon as there is one."""
+    default = app[DEVICES].default_id
+    if default is None:
+        return
+    for job in app[JOBS].list():
+        if job.printer is None:
+            job.printer = default
+            app[JOBS].save(job)
 
 
 async def catalog_of(dev: Device) -> Catalog:
@@ -171,26 +178,66 @@ def _own_tls(request: web.Request) -> bool:
 
 def _via_trusted_https(request: web.Request) -> bool:
     """Through a trusted reverse proxy serving HTTPS (`X-Forwarded-Proto: https`)."""
-    return (_trusted_proxy(_peer(request), request.app[CONFIG].trusted_proxies)
+    return (trusted_proxy(_peer(request), request.app[CONFIG].trusted_proxies)
             and request.headers.get("X-Forwarded-Proto", "").lower() == "https")
+
+
+def _source(request: web.Request) -> str:
+    """Client identity for pairing throttles: the peer address, or behind a trusted proxy the nearest
+    untrusted address in `X-Forwarded-For`. IPv6 clients count per /64, since one host usually holds many."""
+    proxies = request.app[CONFIG].trusted_proxies
+    address = _peer(request) or ""
+    if trusted_proxy(address, proxies):
+        for item in reversed(request.headers.get("X-Forwarded-For", "").split(",")):
+            try:
+                ipaddress.ip_address(item.strip())
+            except ValueError:
+                break
+            address = item.strip()
+            if not trusted_proxy(address, proxies):
+                break
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return address or "unknown"
+    if parsed.version == 6 and parsed.ipv4_mapped:
+        parsed = parsed.ipv4_mapped
+    if parsed.version == 6:
+        return str(ipaddress.ip_network(f"{parsed}/64", strict=False))
+    return str(parsed)
+
+
+# Request body limits, enforced while reading. Model uploads stream through `upload_job` with their own limit;
+# the application-wide limit covers JSON routes, and the public routes get a smaller one.
+JSON_BODY_LIMIT = 64 * 1024
+PUBLIC_BODY_LIMIT = 4 * 1024
+MAX_UPLOADS = 2
+
+
+def _bounded(request: web.Request, limit: int) -> web.Request:
+    """The request with a smaller body limit; refuse a declared larger body before reading anything."""
+    if request.content_length is not None and request.content_length > limit:
+        raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=request.content_length)
+    return request.clone(client_max_size=limit)
 
 
 @web.middleware
 async def transport_middleware(request: web.Request, handler):
     """Restrict HTTP API access to avoid sending tokens and keys in clear text.
 
-    With built-in TLS, HTTP serves only setup and `/healthz`; API and invitations require HTTPS or
-    a trusted HTTPS proxy. Without built-in TLS, only `BRIDGE_TRUSTED_PROXIES` may use the API, if set."""
+    With built-in TLS, HTTP serves only setup and `/healthz`; API, invitations and the setup QR code require
+    HTTPS or a trusted HTTPS proxy. Without built-in TLS, `BRIDGE_TRUSTED_PROXIES` must forward HTTPS
+    (`X-Forwarded-Proto: https`); without trusted proxies, the configuration requires `BRIDGE_PLAIN_HTTP=on`."""
     if _own_tls(request) or request.path in ("/", "/healthz") or not (
-            request.path.startswith("/api/") or request.path == "/invite"):
+            request.path.startswith("/api/") or request.path in ("/invite", "/setup")):
         return await handler(request)
     config = request.app[CONFIG]
     if request.app[TLS].enabled:
         if not _via_trusted_https(request):
             port = config.https_port
             return error(403, m('HTTPS only (port {p0}). Bambro connects this way automatically after pairing.', p0=port))
-    elif config.trusted_proxies and not _trusted_proxy(_peer(request), config.trusted_proxies):
-        return error(403, m('Only available through the configured reverse proxy (BRIDGE_TRUSTED_PROXIES).'))
+    elif config.trusted_proxies and not _via_trusted_https(request):
+        return error(403, m('Only available over HTTPS through the configured reverse proxy (BRIDGE_TRUSTED_PROXIES).'))
     return await handler(request)
 
 
@@ -219,9 +266,22 @@ async def healthz(_request: web.Request) -> web.Response:
     return ok({"ok": True})
 
 
+def _rate_limited(message: str, retry_after: int) -> web.Response:
+    return web.json_response(render({"error": message}), status=429,
+                             headers={"Cache-Control": "no-store", "Retry-After": str(retry_after)})
+
+
 async def pair(request: web.Request) -> web.Response:
+    """Public: exchange the fixed access key, the setup code or an invitation for a token. A blocked client is
+    refused before its body is read; the body is limited to a few kilobytes."""
+    store, source = request.app[AUTH], _source(request)
+    blocked = store.retry_after(source)
+    if blocked is not None:
+        return _rate_limited(m('Too many incorrect setup codes.'), blocked)
     try:
-        body = await request.json()
+        body = await _bounded(request, PUBLIC_BODY_LIMIT).json()
+    except web.HTTPRequestEntityTooLarge:
+        return error(413, m('The request is too large.'))
     except ValueError:
         return error(400, m('Invalid JSON.'))
     if not isinstance(body, dict):
@@ -229,22 +289,24 @@ async def pair(request: web.Request) -> web.Response:
     key = body.get("token")
     secret = request.app[CONFIG].bridge_token
     if key is not None:
-        if not secret or not isinstance(key, str) or not _same_secret(key.strip(), secret):
-            await asyncio.sleep(1.5)  # Rate-limit attempts through the legacy access-key path.
+        try:
+            await store.check_access_key(key, source)
+        except InvalidCode:
             return error(401, m('Incorrect access key.'))
+        except RateLimited as exc:
+            return _rate_limited(m('Too many incorrect access keys.'), exc.retry_after)
         return ok({"app_token": app_token(secret), "bridge_version": __version__})
     code, name = body.get("code"), body.get("device_name")
     if not isinstance(code, str) or not isinstance(name, str):
         return error(422, m('code and device_name are required.'))
     try:
-        token, paired = await request.app[AUTH].pair(code, name)
+        token, paired = await store.pair(code, name, source)
     except ValueError as exc:
         return error(422, message_of(exc))
     except InvalidCode:
         return error(401, m('Setup code is invalid or has expired.'))
     except RateLimited as exc:
-        return web.json_response(render({"error": m('Too many incorrect setup codes.')}), status=429,
-                                 headers={"Cache-Control": "no-store", "Retry-After": str(exc.retry_after)})
+        return _rate_limited(m('Too many incorrect setup codes.'), exc.retry_after)
     except AuthError as exc:
         log.error(m('Could not save device: %s'), exc)
         return error(500, m('Device could not be saved securely.'))
@@ -257,12 +319,9 @@ async def pair(request: web.Request) -> web.Response:
     }, status=201)
 
 
-def _same_secret(given: str, expected: str) -> bool:
-    """Constant-time comparison; values that cannot be encoded as UTF-8 simply fail."""
-    try:
-        return hmac.compare_digest(given.encode(), expected.encode())
-    except UnicodeEncodeError:
-        return False
+def grouped_fingerprint(fingerprint: str) -> str:
+    """SHA-256 fingerprint in groups of four, as Bambro shows it."""
+    return " ".join(fingerprint[i:i + 4] for i in range(0, len(fingerprint), 4))
 
 
 def own_certificate_fingerprint(request: web.Request) -> str | None:
@@ -271,8 +330,7 @@ def own_certificate_fingerprint(request: web.Request) -> str | None:
     would make all subsequent requests fail."""
     if request.app[CONFIG].public_url:
         return None
-    own_tls = request.transport is not None and request.transport.get_extra_info("sslcontext") is not None
-    return request.app[TLS].fingerprint if own_tls else None
+    return request.app[TLS].fingerprint if _own_tls(request) else None
 
 
 async def create_invitation(request: web.Request) -> web.Response:
@@ -293,13 +351,19 @@ async def delete_client_device(request: web.Request) -> web.Response:
     try:
         removed = await request.app[AUTH].remove(request.match_info["device_id"])
         if removed:
-            # Revoked devices must also stop receiving Live Activity messages.
-            request.app[PUSH].remove_device(request.match_info["device_id"])
+            # Revoked devices must also stop receiving Live Activity messages. Pushes check the paired devices before
+            # sending and startup discards leftovers, so a failed save here cannot keep the device subscribed.
+            try:
+                request.app[PUSH].remove_device(request.match_info["device_id"])
+            except OSError as exc:
+                log.error(m('Could not save push tokens: %s'), exc)
     except AuthError as exc:
         log.error(m('Could not revoke device: %s'), exc)
         return error(500, m('Device could not be revoked securely.'))
     if not removed:
         return error(404, m('Device not found.'))
+    if not request.app[AUTH].devices and not request.app[CONFIG].bridge_token:
+        log.warning(m('The last paired device was removed. Pairing stays closed until the bridge is restarted; the new setup code then appears in this log.'))
     return web.Response(status=204, headers={"Cache-Control": "no-store"})
 
 
@@ -330,41 +394,41 @@ def _page_origin(request: web.Request) -> tuple[PublicOrigin | None, bool]:
     return origin, _own_tls(request) or _via_trusted_https(request)
 
 
-def _trusted_proxy(peer: str | None, networks: tuple[str, ...]) -> bool:
-    try:
-        address = ipaddress.ip_address(peer or "")
-        return any(address in ipaddress.ip_network(network, strict=False) for network in networks)
-    except ValueError:
-        return False
-
-
-async def home(request: web.Request, invite_error: str | None = None, http_status: int = 200) -> web.Response:
+async def home(request: web.Request, form_error: str | None = None, http_status: int = 200,
+               headers: dict | None = None) -> web.Response:
+    """Public setup page. It never shows a pairing code, the certificate fingerprint or the printers; the
+    first-device setup code is only in the bridge log, and the QR code needs that code (`POST /setup`)."""
     try:
         origin, secure = _page_origin(request)
     except URLConfigurationError as exc:
         return web.Response(text=render(message_of(exc)), status=400, content_type="text/plain")
-    config, tls_state = request.app[CONFIG], request.app[TLS]
-    printers = []
-    for dev in request.app[DEVICES].list():
-        status = dev.printer.status()
-        printers.append({"name": dev.name, "model": dev.model,
-                         "connected": bool(status.get("connection", {}).get("connected"))})
+    store = request.app[AUTH]
     body = setup_page(
         identity=request.app[IDENTITY],
-        printers=printers,
-        setup_code=request.app[AUTH].setup_code,
         origin=origin,
-        fingerprint=tls_state.fingerprint,
-        fixed_key=bool(config.bridge_token),
-        can_invite=bool(config.bridge_token and secure and origin),
-        invite_error=invite_error,
+        fixed_key=bool(request.app[CONFIG].bridge_token),
+        paired=bool(store.devices),
+        setup_minutes=_setup_minutes(store),
+        secure=secure,
+        error=form_error,
     )
-    return web.Response(text=body, status=http_status, content_type="text/html", headers=PAGE_HEADERS)
+    return web.Response(text=body, status=http_status, content_type="text/html",
+                        headers={**PAGE_HEADERS, **(headers or {})})
+
+
+def _setup_minutes(store: PairingStore) -> int | None:
+    seconds = store.setup_remaining
+    return (seconds + 59) // 60 if seconds else None
+
+
+async def _page_form(request: web.Request):
+    """Form of a public page, limited to a few kilobytes while reading."""
+    return await _bounded(request, PUBLIC_BODY_LIMIT).post()
 
 
 async def web_invite(request: web.Request) -> web.Response:
     """Setup-page invitation: the fixed access key grants a QR code for another device.
-    Requires HTTPS; incorrect keys are rate-limited as in pairing."""
+    Requires HTTPS; incorrect keys are throttled per client as in pairing."""
     config = request.app[CONFIG]
     try:
         origin, secure = _page_origin(request)
@@ -372,19 +436,56 @@ async def web_invite(request: web.Request) -> web.Response:
         return web.Response(text=render(message_of(exc)), status=400, content_type="text/plain")
     if not config.bridge_token or not origin or not secure:
         return await home(request, m('Invitations using an access key require HTTPS and a fixed access key.'), 400)
-    form = await request.post()
-    key = form.get("key")
-    if not isinstance(key, str) or not _same_secret(key.strip(), config.bridge_token):
-        await asyncio.sleep(1.5)  # Rate-limit attempts as in pairing.
-        return await home(request, m('Incorrect access key.'), 401)
+    store, source = request.app[AUTH], _source(request)
+    blocked = store.retry_after(source)
+    if blocked is not None:
+        return await home(request, m('Too many incorrect access keys.'), 429, {"Retry-After": str(blocked)})
     try:
-        invitation = await request.app[AUTH].invite(Principal("access_key"))
+        form = await _page_form(request)
+        await store.check_access_key(form.get("key"), source)
+    except web.HTTPRequestEntityTooLarge:
+        return await home(request, m('The request is too large.'), 413)
+    except InvalidCode:
+        return await home(request, m('Incorrect access key.'), 401)
+    except RateLimited as exc:
+        return await home(request, m('Too many incorrect access keys.'), 429, {"Retry-After": str(exc.retry_after)})
+    try:
+        invitation = await store.invite(Principal("access_key"))
     except ValueError as exc:
         return await home(request, message_of(exc), 429)
     fingerprint = request.app[TLS].fingerprint if origin.include_fingerprint else None
     identity = request.app[IDENTITY]
     body = invitation_page(identity=identity, link=pairing_url(origin, invitation.code, identity.name, fingerprint),
                            code=invitation.code, minutes=max(1, (invitation.expires_at - int(time.time())) // 60))
+    return web.Response(text=body, content_type="text/html", headers=PAGE_HEADERS)
+
+
+async def web_setup(request: web.Request) -> web.Response:
+    """Setup-page QR code for the first device: whoever enters the setup code from the bridge log gets the
+    pairing link with this bridge's address and certificate fingerprint. Requires HTTPS; throttled as pairing."""
+    try:
+        origin, secure = _page_origin(request)
+    except URLConfigurationError as exc:
+        return web.Response(text=render(message_of(exc)), status=400, content_type="text/plain")
+    store, source = request.app[AUTH], _source(request)
+    if request.app[CONFIG].bridge_token or not store.setup_open or not origin or not secure:
+        return await home(request, m('The setup QR code is available only over HTTPS while pairing is open.'), 400)
+    blocked = store.retry_after(source)
+    if blocked is not None:
+        return await home(request, m('Too many incorrect setup codes.'), 429, {"Retry-After": str(blocked)})
+    try:
+        form = await _page_form(request)
+        code = await store.check_setup(form.get("code"), source)
+    except web.HTTPRequestEntityTooLarge:
+        return await home(request, m('The request is too large.'), 413)
+    except InvalidCode:
+        return await home(request, m('Setup code is invalid or has expired.'), 401)
+    except RateLimited as exc:
+        return await home(request, m('Too many incorrect setup codes.'), 429, {"Retry-After": str(exc.retry_after)})
+    fingerprint = request.app[TLS].fingerprint if origin.include_fingerprint else None
+    identity = request.app[IDENTITY]
+    body = invitation_page(identity=identity, link=pairing_url(origin, code, identity.name, fingerprint),
+                           code=code, minutes=_setup_minutes(store) or 1, label=t('Pair Bambro'))
     return web.Response(text=body, content_type="text/html", headers=PAGE_HEADERS)
 
 
@@ -410,12 +511,11 @@ def full_status(app: web.Application, dev: Device) -> dict:
     status["bridge"] = {"version": __version__, "slicing": app[SLICER].busy}
     # Filament library: the spool in each slot (Bambu chip or NFC tag) with its remaining amount.
     loaded = app[SPOOLS].loaded(dev.id)
-    for unit in status["ams"].get("units") or []:
-        for tray in unit.get("trays") or []:
-            tray["spool"] = SpoolStore.public(loaded[tray["slot"]]) if tray["slot"] in loaded else None
-    for tray in status["ams"].get("externals") or ([status["ams"]["external"]] if status["ams"].get("external") else []):
-        if tray:
-            tray["spool"] = SpoolStore.public(loaded[tray["slot"]]) if tray["slot"] in loaded else None
+    for tray in trays_of(status):
+        tray["spool"] = SpoolStore.public(loaded[tray["slot"]]) if tray["slot"] in loaded else None
+    # New spools reset to Generic: flagged until their filament is set or a tag is read (newspool.py).
+    if dev.new_spools is not None:
+        dev.new_spools.annotate(status)
     return status
 
 
@@ -432,8 +532,13 @@ async def get_status(request: web.Request) -> web.Response:
     return ok(full_status(request.app, dev))
 
 
+STATUS_GAP = 0.5   # Seconds between two status events of one stream.
+EVENT_PING = 15.0  # Seconds of silence before a stream sends a comment to keep the connection open.
+
+
 async def events(request: web.Request) -> web.StreamResponse:
-    """Server-Sent Events: `status` on changes (at most twice per second), `job` for job changes."""
+    """Server-Sent Events: `status` on changes of this printer (at most every `STATUS_GAP`, the last change always
+    follows), `job` for job changes, and a `: ping` comment after `EVENT_PING` seconds without events."""
     response = web.StreamResponse(headers={
         "Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no"})
     dev = device(request)
@@ -448,7 +553,7 @@ async def events(request: web.Request) -> web.StreamResponse:
         last_status = time.monotonic()
         pending_status = False
         while True:
-            timeout = 15 if not pending_status else max(0.0, 0.5 - (time.monotonic() - last_status))
+            timeout = EVENT_PING if not pending_status else max(0.0, STATUS_GAP - (time.monotonic() - last_status))
             try:
                 event, data = await asyncio.wait_for(queue.get(), timeout)
             except TimeoutError:
@@ -462,7 +567,7 @@ async def events(request: web.Request) -> web.StreamResponse:
             if event == "status":
                 if data.get("printer") != dev.id:
                     continue
-                if time.monotonic() - last_status >= 0.5:
+                if time.monotonic() - last_status >= STATUS_GAP:
                     dev = devices.devices.get(dev.id, dev)
                     await _send_event(response, "status", full_status(request.app, dev))
                     last_status, pending_status = time.monotonic(), False
@@ -510,6 +615,8 @@ async def control(request: web.Request) -> web.Response:
         return error(409, refused)
     if action == "clear_error":
         return await _clear_error(printer, status)
+    if action == "error_action":
+        return await _error_action(printer, status, value)
     objects = None
     if action == "skip_objects":
         try:
@@ -535,13 +642,21 @@ async def control(request: web.Request) -> web.Response:
         await printer.pushall(force=True)
     if action == "read_rfid":
         # Reading takes about 20 seconds (the AMS turns the spool); fetch the result afterwards.
-        task = asyncio.create_task(_pushall_after(printer, (25, 60)))
-        _background.add(task)
-        task.add_done_callback(_background.discard)
+        _pushall_later(printer, (25, 60))
     return ok({"ok": True})
 
 
 _background: set[asyncio.Task] = set()
+
+# Right after an AMS setting the printer may still report the slot's previous filament for a few messages (Bambu
+# Studio ignores the slot's next pushes), so the `pushall` sent at once can come too early: ask again shortly after.
+AMS_SETTING_PUSHALL = (3, 10)
+
+
+def _pushall_later(printer, delays: tuple[int, ...]) -> None:
+    task = asyncio.create_task(_pushall_after(printer, delays))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
 
 
 async def _pushall_after(printer, delays: tuple[int, ...]) -> None:
@@ -615,10 +730,25 @@ async def ams_drying(request: web.Request) -> web.Response:
 async def _clear_error(printer: Printer, status: dict) -> web.Response:
     """Acknowledge the display message, like OK in Bambu Studio's error dialog."""
     try:
-        quit_error, close_dialog = controls.clear_error(status)
-        await printer.command(*quit_error)
+        commands = controls.clear_error(status)
     except controls.ControlError as exc:
         return error(exc.status, exc.message)
+    return await _answer_message(printer, *commands)
+
+
+async def _error_action(printer: Printer, status: dict, value) -> web.Response:
+    """Recovery action for the display message (Retry, Resume, Stop …), like a button in Bambu Studio's error
+    dialog."""
+    try:
+        commands = controls.error_action(value, status)
+    except controls.ControlError as exc:
+        return error(exc.status, exc.message)
+    return await _answer_message(printer, *commands)
+
+
+async def _answer_message(printer: Printer, answer: controls.Command, close_dialog: controls.Command) -> web.Response:
+    try:
+        await printer.command(*answer)
     except PrinterError as exc:
         return error(409, message_of(exc))
     try:
@@ -657,6 +787,8 @@ async def set_tray(request: web.Request) -> web.Response:
         capabilities = status.get("printer", {}).get("capabilities") or {}
         section, command = controls.tray_setting(slot, info, str(color or ""), tray.get("source"), colors,
                                                  bool(body.get("gradient")), bool(capabilities.get("multi_color")))
+        if dev.new_spools is not None:
+            dev.new_spools.user_set(slot)  # Before sending: a new spool's Generic setting must not follow it.
         await printer.command(section, command)
     except ProfileError as exc:
         return error(422, message_of(exc))
@@ -665,6 +797,7 @@ async def set_tray(request: web.Request) -> web.Response:
     except PrinterError as exc:
         return error(409, message_of(exc))
     await printer.pushall(force=True)
+    _pushall_later(printer, AMS_SETTING_PUSHALL)
     return ok({"ok": True})
 
 
@@ -716,48 +849,155 @@ async def select_k_value(request: web.Request) -> web.Response:
     except PrinterError as exc:
         return error(409, message_of(exc))
     await printer.pushall(force=True)
+    _pushall_later(printer, AMS_SETTING_PUSHALL)
     return ok({"ok": True})
 
 
 # --- Current print: objects ---
 
-async def current_print_file(app: web.Application, dev: Device) -> tuple[Path, int]:
-    """Current print's 3MF and plate. Bridge prints use the local file; other prints download
-    `<job>.gcode.3mf` from the SD card, where OrcaSlicer and Bambu Studio store it."""
+def _card_stem(path: str | None) -> str | None:
+    """SD card file name without directory and `.gcode.3mf`, or None when `path` names no card file (empty, or the
+    printer's unpacked `/data/Metadata/plate_N.gcode`)."""
+    name = PurePosixPath(str(path or "").strip()).name
+    if not name or re.fullmatch(r"plate_\d+\.gcode", name):
+        return None
+    lower = name.lower()
+    suffix = next((s for s in (".gcode.3mf", ".3mf", ".gcode") if lower.endswith(s)), "")
+    return name[:len(name) - len(suffix)] or None
+
+
+def current_print_job(app: web.Application, dev: Device, job: dict) -> Job | None:
+    """The bridge job of the running print (`status["job"]`), or None for prints from elsewhere.
+
+    Display names are not unique (file stems, project names), so they count last:
+    1. the SD card file the printer reports is the job's card file (bridge uploads carry the job ID in the name,
+       imports keep their card path); the most recently sent job wins;
+    2. the print this bridge started, until the printer leaves it (`Device.started_job`);
+    3. the display name, only when the printer reports no card file, the bridge did not see this print start (for
+       example after a restart) and exactly one job fits name, plate and subtask."""
+    candidates = [j for j in app[JOBS].list() if j.sent and j.printer == dev.id]
+    stem = _card_stem(job.get("file"))
+    if stem:
+        named = [j for j in candidates if _card_stem(j.sent.get("remote_name")) == stem]
+        if named:
+            return max(named, key=lambda j: j.sent.get("at") or 0)
+    started = next((j for j in candidates if j.id == dev.started_job), None)
+    if started is not None and started.name == job.get("name"):
+        return started
+    if stem or dev.start_seen:
+        return None
+    plate, subtask = job.get("plate_index"), job.get("subtask_id")
+    named = [j for j in candidates if j.name == job.get("name")
+             and not (plate and j.sent.get("plate") and j.sent["plate"] != plate)
+             and not (subtask and j.sent.get("subtask_id") and j.sent["subtask_id"] != subtask)]
+    return named[0] if len(named) == 1 else None
+
+
+def _same_card_time(a: str | None, b: str | None) -> bool:
+    """Compare SD card listing times. LIST shows the time only for recent files (`Nov 20 14:48`) and the date for older
+    ones (`2025-05-20`), so a file that ages past that point keeps matching by date."""
+    if a == b:
+        return True
+    first, second = iso_modified(a), iso_modified(b)
+    if not first or not second:
+        return False
+    if "T" in first and "T" in second:
+        return first == second
+    return first[:10] == second[:10]
+
+
+async def _card_entry(dev: Device, path: str) -> dict | None:
+    """Listing entry of an SD card file (`cache/name.gcode.3mf`), or None when it is not there."""
+    directory, _, name = ("/" + path.lstrip("/")).rpartition("/")
+    listing = await asyncio.to_thread(ftps.list_dir, dev.host, dev.access_code, directory or "/",
+                                      context=dev.trust.context())
+    return next((e for e in listing if e["name"] == name and not e["is_dir"]), None)
+
+
+def _card_unchanged(job: Job, entry: dict | None, local: Path) -> bool:
+    """Is the SD card file still the one the bridge imported or uploaded (size, and listing time when recorded)?"""
+    if entry is None or entry["size"] != local.stat().st_size:
+        return False
+    recorded = job.card_file or {}
+    return "modified" not in recorded or _same_card_time(recorded["modified"], entry["modified"])
+
+
+async def current_print_file(app: web.Application, dev: Device) -> tuple[Path, int, Job | None]:
+    """Current print's 3MF, plate and bridge job (see `current_print_job`). Bridge prints use the job's file while it is
+    what the printer runs; otherwise download the card file: the job's, or `<name>.gcode.3mf`, where OrcaSlicer
+    and Bambu Studio store it."""
     status = dev.printer.status()
     job = status["job"]
     if not job["active"] or not job["name"]:
         raise JobError(m('No print is running.'))
+    if job.get("calibration"):
+        raise JobError(m('A calibration has no print file.'))
+    if any(j.state == "sending" and j.name == job["name"] and j.printer == dev.id for j in app[JOBS].list()):
+        # The printer already reports the bridge's print, but the bridge has not confirmed it yet.
+        raise JobError(m('The print is still starting.'))
     plate = job.get("plate_index") or 1
-    for candidate in app[JOBS].list():
-        if (candidate.sent and candidate.name == job["name"] and candidate.printer in (None, dev.id)
-                and app[JOBS].output_path(candidate).exists()):
-            return app[JOBS].output_path(candidate), candidate.sent.get("plate") or plate
-    config = app[CONFIG]
+    candidate = current_print_job(app, dev, job)
     remote = f"{job['name']}.gcode.3mf"
+    if candidate is not None:
+        plate = candidate.sent.get("plate") or plate
+        local = app[JOBS].output_path(candidate)
+        remote = candidate.sent.get("remote_name") or remote
+        # Sliced again after sending: the card still holds what the printer runs.
+        fresh = local.exists() and local.stat().st_mtime <= (candidate.sent.get("at") or 0)
+        if fresh and (not candidate.remote_path or dev.started_job == candidate.id):
+            return local, plate, candidate
+        if fresh:
+            # Imported from the card: another slicer may have replaced the file under the same name since.
+            async with dev.print_file_lock:
+                entry = await _card_entry(dev, remote)
+            if _card_unchanged(candidate, entry, local):
+                return local, plate, candidate
+    return await _cached_card_file(app, dev, remote), plate, candidate
+
+
+async def _cached_card_file(app: web.Application, dev: Device, remote: str) -> Path:
+    """Download an SD card file into `printcache` once per name, size and listing time."""
+    config = app[CONFIG]
+    limit = config.max_upload_mb * 1024 * 1024
     # Thumbnail, preview and object requests often overlap: use one printer session and one download.
     async with dev.print_file_lock:
-        listing = await asyncio.to_thread(ftps.list_dir, dev.host, dev.access_code, "/", context=dev.trust.context())
-        entry = next((e for e in listing if e["name"] == remote and not e["is_dir"]), None)
+        entry = await _card_entry(dev, remote)
         if entry is None:
             raise JobError(m('“{p0}” is not on the SD card.', p0=remote))
+        if entry["size"] > limit:
+            raise JobError(m('File is larger than {p0} MB.', p0=config.max_upload_mb))
         cache = config.data_dir / "printcache"
         cache.mkdir(parents=True, exist_ok=True)
-        local = cache / f"{hashlib.sha1(f'{dev.id}/{remote}'.encode()).hexdigest()[:16]}-{entry['size']}.gcode.3mf"
+        key = hashlib.sha1(f"{dev.id}/{remote}/{entry['modified']}".encode()).hexdigest()[:16]
+        local = cache / f"{key}-{entry['size']}.gcode.3mf"
         if not local.exists():
+            def fetch() -> None:
+                ftps.download(dev.host, dev.access_code, "/" + remote.lstrip("/"), local, context=dev.trust.context(),
+                              limit=limit)
             try:
-                await asyncio.to_thread(ftps.download, dev.host, dev.access_code, f"/{remote}", local, context=dev.trust.context())
-            except (OSError, EOFError):
-                # At print start, busy printers often drop FTP connections; retry once.
-                await asyncio.sleep(2)
-                await asyncio.to_thread(ftps.download, dev.host, dev.access_code, f"/{remote}", local, context=dev.trust.context())
-            for old in sorted(cache.glob("*.gcode.3mf"), key=lambda f: f.stat().st_mtime)[:-3 * len(app[DEVICES].devices)]:
-                old.unlink(missing_ok=True)
-    return local, plate
+                try:
+                    await asyncio.to_thread(fetch)
+                except (OSError, EOFError):
+                    # At print start, busy printers often drop FTP connections; retry once.
+                    await asyncio.sleep(2)
+                    await asyncio.to_thread(fetch)
+            except ftps.TooLarge:
+                raise JobError(m('File is larger than {p0} MB.', p0=config.max_upload_mb)) from None
+            _prune_print_cache(cache, keep=3 * len(app[DEVICES].devices))
+    return local
+
+
+def _prune_print_cache(cache: Path, keep: int) -> None:
+    """Keep the newest downloaded print files; remove older ones together with their previews."""
+    for old in sorted(cache.glob("*.gcode.3mf"), key=lambda f: f.stat().st_mtime)[:-keep]:
+        old.unlink(missing_ok=True)
+    for sidecar in cache.glob("*.opv"):
+        if not sidecar.with_name(sidecar.name.rsplit("-plate", 1)[0] + ".3mf").exists():
+            sidecar.unlink(missing_ok=True)
 
 
 async def current_objects(app: web.Application, dev: Device) -> dict:
-    path, plate = await current_print_file(app, dev)
+    path, plate, _ = await current_print_file(app, dev)
     objects = await asyncio.to_thread(read_objects, path, plate)
     skipped = set(dev.printer.status()["job"].get("skipped_objects") or [])
     for obj in objects:
@@ -768,16 +1008,12 @@ async def current_objects(app: web.Application, dev: Device) -> dict:
 async def print_thumbnail(request: web.Request) -> web.Response:
     """Current plate thumbnail, including prints from OrcaSlicer or Bambu Studio."""
     try:
-        path, plate = await current_print_file(request.app, device(request))
+        path, plate, _ = await current_print_file(request.app, device(request))
         data = await asyncio.to_thread(_read_thumbnail, path, plate)
     except (JobError, OSError, ValueError, KeyError) as exc:
         return error(404, m('No thumbnail: {p0}', p0=exc))
-    return web.Response(body=data, content_type="image/png", headers={"Cache-Control": "max-age=600"})
-
-
-def _read_member(path: Path, member: str) -> bytes:
-    with open_archive(path) as archive:
-        return read_member(archive, member)
+    # One URL per printer whose picture changes with every print: never cache it.
+    return web.Response(body=data, content_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 def _read_thumbnail(path: Path, plate: int) -> bytes:
@@ -877,16 +1113,38 @@ async def sdcard_import(request: web.Request) -> web.Response:
         return error(422, message_of(exc) or m('Invalid JSON.'))
     if not name.lower().endswith(".gcode.3mf"):
         return error(422, m('Only sliced 3MF files (.gcode.3mf).'))
-    store, dev = request.app[JOBS], device(request)
-    job = store.create(name, dev.id)
+    store, dev, config = request.app[JOBS], device(request), request.app[CONFIG]
+    limit = config.max_upload_mb * 1024 * 1024
+
+    def too_large() -> web.Response:
+        return error(422, m('File is larger than {p0} MB.', p0=config.max_upload_mb))
+
     remote = f"{directory.rstrip('/')}/{name}"
     try:
-        await asyncio.to_thread(ftps.download, dev.host, dev.access_code, remote, store.input_path(job), context=dev.trust.context())
-        job.result = {**await asyncio.to_thread(read_slice_info, store.input_path(job)), "warnings": []}
+        entry = await _card_entry(dev, remote)
+    except Exception as exc:  # noqa: BLE001 - FTPS, TLS, certificate errors
+        return error(502, m('Could not import: {p0}', p0=exc))
+    if entry is None:
+        return error(404, m('“{p0}” is not on the SD card.', p0=remote.lstrip("/")))
+    if entry["size"] > limit:
+        return too_large()
+    job = store.create(name, dev.id)
+    local = store.input_path(job)
+    try:
+        await asyncio.to_thread(ftps.download, dev.host, dev.access_code, remote, local, context=dev.trust.context(),
+                                limit=limit)
+        if local.stat().st_size != entry["size"]:
+            raise JobError(m('The file changed on the SD card while it was imported. Import it again.'))
+        job.result = {**await asyncio.to_thread(read_slice_info, local), "warnings": []}
         job.result["plate"] = job.result["plates"][0]["index"]
+    except ftps.TooLarge:
+        store.delete(job.id)
+        return too_large()
     except Exception as exc:  # noqa: BLE001
         store.delete(job.id)
         return error(502, m('Could not import: {p0}', p0=exc))
+    # The job prints the card file in place; record it so a replaced file is not printed unnoticed.
+    job.card_file = {"size": entry["size"], "modified": entry["modified"]}
     job.state, job.remote_path = "sliced", remote.lstrip("/")
     _publish_job(request.app, job)
     store.prune()
@@ -894,7 +1152,7 @@ async def sdcard_import(request: web.Request) -> web.Response:
 
 
 class _TransferStopped(Exception):
-    """The app canceled the download; stop the FTPS thread."""
+    """The app canceled the download, or the bridge stopped sending a print: stop the FTPS thread."""
 
 
 _DOWNLOADS: set[asyncio.Future] = set()
@@ -1045,8 +1303,7 @@ async def list_jobs(request: web.Request) -> web.Response:
     jobs = request.app[JOBS].list()
     if "printer_id" in request.match_info:
         dev = device(request)
-        default = request.app[DEVICES].default_id
-        jobs = [j for j in jobs if j.printer == dev.id or (j.printer is None and dev.id == default)]
+        jobs = [j for j in jobs if j.printer == dev.id]
     return ok({"jobs": [j.public() for j in jobs]})
 
 
@@ -1124,6 +1381,18 @@ async def upload_job(request: web.Request) -> web.Response:
     _publish_job(request.app, job)
     store.prune()
     return ok(job.public(), status=201)
+
+
+UPLOADS = web.AppKey("uploads", asyncio.Semaphore)
+
+
+async def limited_upload(request: web.Request) -> web.Response:
+    """At most MAX_UPLOADS uploads at once: each holds disk space and a thread that checks the file."""
+    slots = request.app[UPLOADS]
+    if slots.locked():
+        return error(429, m('Another upload is still in progress. Try again when it has finished.'))
+    async with slots:
+        return await upload_job(request)
 
 
 def _project_fits(catalog: Catalog, printer: dict | None) -> bool:
@@ -1205,7 +1474,7 @@ async def slice_job(request: web.Request) -> web.Response:
                     # retain 3MF model orientation unless the app explicitly overrides it.
                     "orient": bool(body.get("orient", job.settings.get("orient", job.kind == "model")))}
     job.state, job.error, job.result = "slicing", None, None
-    job.sent_plates, job.uploaded = [], None
+    job.sent_plates, job.uploaded, job.card_file = [], None, None
     _publish_job(request.app, job)
     task = asyncio.create_task(_run_slice(request.app, job))
     request.app[TASKS].add(task)
@@ -1214,12 +1483,8 @@ async def slice_job(request: web.Request) -> web.Response:
 
 
 def _find_tray(status: dict, slot) -> dict | None:
-    if not isinstance(slot, int):
-        return None
-    ams = status["ams"]
-    trays = [t for unit in ams["units"] for t in unit["trays"]]
-    trays.extend(ams.get("externals") or ([ams["external"]] if ams.get("external") else []))
-    tray = next((t for t in trays if t["slot"] == slot), None)
+    """The slot `slot` when it holds filament (a number, not `true`), else None."""
+    tray = controls.find_tray(status, slot)
     return tray if tray and not tray["empty"] else None
 
 
@@ -1234,7 +1499,8 @@ async def _run_slice(app: web.Application, job: Job) -> None:
             colors=job.settings.get("colors"), orient=job.settings.get("orient", False),
             copies=job.settings.get("copies", 1))
         job.result, job.state = result, "sliced"
-        for cache in store.dir(job.id).glob("preview*.bin"):
+        # Previews of the previous slice result (`.opv` from older bridge versions' current print preview).
+        for cache in (*store.dir(job.id).glob("preview*.bin"), *store.dir(job.id).glob("*.opv")):
             cache.unlink(missing_ok=True)
     except (SliceError, ProfileError, JobError, OSError) as exc:
         job.state, job.error = "failed", message_of(exc)
@@ -1247,9 +1513,6 @@ async def _run_slice(app: web.Application, job: Job) -> None:
             await job_preview_data(app, job)  # Precompute so the app can retrieve it immediately.
         except Exception:  # noqa: BLE001 - preview is optional and separate from slicing
             log.exception(m('Preview failed for %s'), job.id)
-
-
-PREVIEW_LOCKS = web.AppKey("preview_locks", dict)
 
 
 async def job_bed(app: web.Application, job: Job) -> tuple[float, float]:
@@ -1272,8 +1535,7 @@ async def job_preview_data(app: web.Application, job: Job, plate: int | None = N
     if plate not in plates:
         raise JobError(m('Plate {p0} does not exist.', p0=plate))
     cache = app[JOBS].dir(job.id) / f"preview-{plate}.bin"
-    lock = app[PREVIEW_LOCKS].setdefault(job.id, asyncio.Lock())
-    async with lock:
+    async with app[JOBS].preview_lock(job.id):
         if cache.exists():
             return cache.read_bytes()
         bed = await job_bed(app, job)
@@ -1304,7 +1566,10 @@ async def print_preview(request: web.Request) -> web.Response:
     """Current print preview, including OrcaSlicer/Bambu Studio prints; the app marks the current layer."""
     dev = device(request)
     try:
-        path, plate = await current_print_file(request.app, dev)
+        path, plate, job = await current_print_file(request.app, dev)
+        if job is not None and job.result and path == request.app[JOBS].output_path(job):
+            # The job's own file: share the job preview cache, which slicing again clears.
+            return _binary(await job_preview_data(request.app, job, plate))
         cache = path.with_name(f"{path.stem}-plate{plate}.opv")
         if not cache.exists():
             bed = tuple((await catalog_of(dev)).bed_size())
@@ -1321,7 +1586,8 @@ async def job_thumbnail(request: web.Request) -> web.Response:
     data = request.app[JOBS].thumbnail(job, int(plate) if plate and plate.isdigit() else None)
     if data is None:
         return error(404, m('No thumbnail.'))
-    return web.Response(body=data, content_type="image/png", headers={"Cache-Control": "max-age=3600"})
+    # Slicing again changes the picture under the same URL.
+    return web.Response(body=data, content_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 def build_mapping(plate: dict, chosen: dict[int, int], status: dict) -> tuple[list[int], bool]:
@@ -1407,6 +1673,7 @@ PRINT_ATTEMPTS = 3
 PRINT_RETRY_DELAYS = (5.0, 15.0)
 PRINTER_WAIT = 60.0        # Maximum wait for the printer connection.
 START_CONFIRM_WAIT = 120.0  # Maximum wait for the printer to report preparing or printing.
+START_POLL = 1.0           # Seconds between status checks while waiting for that.
 RESUME_WINDOW = 600.0      # Resume only jobs younger than this after a restart.
 STARTED_STATES = {"PREPARE", "RUNNING", "PAUSE", "SLICING"}
 
@@ -1430,8 +1697,7 @@ async def print_job(request: web.Request) -> web.Response:
     if job.state not in ("sliced", "sent", "failed") or not job.result:
         return error(409, m('Slice the file first.'))
     dev = job_device(app, job)
-    if dev.print_lock.locked() or any(j.state == "sending" and (j.printer or app[DEVICES].default_id) == dev.id
-                                      for j in app[JOBS].list()):
+    if dev.print_lock.locked() or any(j.state == "sending" and j.printer == dev.id for j in app[JOBS].list()):
         return error(409, m('Another print is being sent to this printer.'))
     try:
         body = await request.json()
@@ -1455,7 +1721,7 @@ async def _print_plan(app: web.Application, dev: Device, job: Job, body: Any) ->
         raise PrintRefused(m('Printer not connected.'))
     if refused := _commands_refused(status):
         raise PrintRefused(refused)
-    if status["job"]["state"] not in IDLE_STATES:
+    if status["job"]["state"] not in controls.IDLE:
         raise PrintRefused(m('The printer is busy.'))
     if not status["connection"]["sdcard"]:
         raise PrintRefused(m('No SD card in the printer.'))
@@ -1473,7 +1739,7 @@ async def _print_plan(app: web.Application, dev: Device, job: Job, body: Any) ->
     if not isinstance(raw_mapping, dict):
         raise PrintRefused(m('mapping must be an object.'), 422)
     for key, slot in raw_mapping.items():
-        if not str(key).isdigit() or not isinstance(slot, int):
+        if not str(key).isdigit() or not isinstance(slot, int) or isinstance(slot, bool):
             raise PrintRefused(m('mapping: Filament ID → slot number.'), 422)
         chosen[int(key)] = slot
     if not chosen and len(plate["filaments"]) == 1 and isinstance(job.settings.get("slot"), int):
@@ -1486,6 +1752,12 @@ async def _print_plan(app: web.Application, dev: Device, job: Job, body: Any) ->
     if model_id not in LEGACY_MODELS and not new_protocol:
         # New model without OrcaSlicer data in the image: the old file:///sdcard command would be wrong.
         raise PrintRefused(m('The bridge is missing data for this printer model; starting a print with the older command would be rejected. Update the bridge.'))
+    try:
+        target = await asyncio.to_thread(sliced_for, app[JOBS].output_path(job), plate_index)
+    except (JobError, OSError) as exc:
+        raise PrintRefused(m('Cannot read file: {p0}', p0=message_of(exc)), 422) from None
+    if refused := _sliced_for_other_printer(dev, status, model_id, target):
+        raise PrintRefused(refused)
     try:
         if new_protocol:
             metadata = await asyncio.to_thread(read_print_metadata, app[JOBS].output_path(job), plate_index)
@@ -1519,6 +1791,31 @@ async def _print_plan(app: web.Application, dev: Device, job: Job, body: Any) ->
             raise PrintRefused(m('extrude_cali_manual_mode must be 0 or 1.'), 422)
         plan["extrude_cali_manual_mode"] = mode
     return plan
+
+
+def _sliced_for_other_printer(dev: Device, status: dict, model_id: str, target: dict) -> str | None:
+    """Refuse a file sliced for another printer model or nozzle, as the app's direct mode does (`DirectPrint.plan`):
+    its start G-code, bed size and extrusion are made for that printer. `target` comes from `sliced_for`."""
+    name, raw_id = target.get("model"), target.get("model_id")
+    record = (dev.models.find(name) if name else None) or (dev.models.find(model_id=raw_id) if raw_id else None)
+    if record is not None:
+        wanted, label = record.model_id, record.name
+    elif name:
+        wanted, label = model_id_from_name(name) or model_id_from_name(f"Bambu Lab {name}"), name
+    else:
+        wanted = raw_id.removesuffix("-V2") if raw_id else None
+        label = next((n for n, i in MODEL_IDS_BY_NAME.items() if i == wanted), raw_id)
+    own = dev.models.find(model_id=model_id)
+    printer_name = (own.name if own else None) or status["printer"].get("model") or dev.model or model_id
+    if label and wanted != model_id and not (record and own and record.name == own.name):
+        # Also a model the bridge does not know: then it is not this printer, whose model is known here.
+        return m('The file was sliced for {p0}, but this printer is a {p1}. Please slice it again for this printer.',
+                 p0=label, p1=printer_name)
+    wanted_nozzle, installed = target.get("nozzle"), (status.get("nozzle") or {}).get("diameter")
+    if wanted_nozzle and installed and abs(wanted_nozzle - installed) > 0.01:
+        return m('The file was sliced for a {p0} mm nozzle, but a {p1} mm nozzle is installed.',
+                 p0=f"{wanted_nozzle:g}", p1=f"{installed:g}")
+    return None
 
 
 def _start_sending(app: web.Application, job: Job) -> None:
@@ -1557,6 +1854,7 @@ async def _send_print(app: web.Application, dev: Device, job: Job) -> None:
                 await asyncio.sleep(PRINT_RETRY_DELAYS[min(attempt - 1, len(PRINT_RETRY_DELAYS) - 1)])
                 continue
             _finish_print(app, job, reply=reply)
+            dev.started_job = job.id  # The running print is this job until the printer leaves it.
             await dev.printer.pushall(force=True)
             return
 
@@ -1576,22 +1874,32 @@ async def _attempt_print(app: web.Application, dev: Device, job: Job, plan: dict
     if state["state"] in STARTED_STATES and state.get("file") and name in state["file"]:
         # An earlier attempt already started printing; only its confirmation was lost.
         return None
-    if state["state"] not in IDLE_STATES:
+    if state["state"] not in controls.IDLE:
         raise PrintRefused(m('The printer is busy.'))
 
-    if not job.remote_path and not plan.get("uploaded") and job.uploaded == name:
-        # Another plate of the same slice result: reuse the SD card file if its size matches.
+    if job.remote_path:
+        # Imported from the card and printed in place: only if it is still the file the owner imported.
         _set_step(app, job, m('Checking the file on the SD card'))
-        listing = await asyncio.to_thread(ftps.list_dir, dev.host, dev.access_code, "/", context=dev.trust.context())
-        size = next((e["size"] for e in listing if e["name"] == name), None)
-        plan["uploaded"] = size == app[JOBS].output_path(job).stat().st_size
+        entry = await _card_entry(dev, job.remote_path)
+        if entry is None:
+            raise PrintRefused(m('“{p0}” is not on the SD card.', p0=job.remote_path))
+        if not _card_unchanged(job, entry, app[JOBS].output_path(job)):
+            raise PrintRefused(m('The file on the SD card has changed since it was imported. Import it again to print it.'))
+
+    if not job.remote_path and not plan.get("uploaded") and job.uploaded == name:
+        # Another plate of the same slice result: reuse the SD card file if size and listing time still match.
+        _set_step(app, job, m('Checking the file on the SD card'))
+        plan["uploaded"] = _card_unchanged(job, await _card_entry(dev, name), app[JOBS].output_path(job))
 
     if not job.remote_path and not plan.get("uploaded"):
         local = app[JOBS].output_path(job)
         loop = asyncio.get_running_loop()
         last = [0.0]
+        stop = threading.Event()
 
         def progress(sent: int, total: int) -> None:
+            if stop.is_set():
+                raise _TransferStopped  # Sending was canceled (shutdown): end the upload thread too.
             now = time.monotonic()
             if now - last[0] > 0.5 or sent == total:
                 last[0] = now
@@ -1599,34 +1907,76 @@ async def _attempt_print(app: web.Application, dev: Device, job: Job, plan: dict
                 loop.call_soon_threadsafe(app[EVENTS].publish, "job", job.public())
 
         _set_step(app, job, m('Uploading to the SD card'), 0.0)
-        await asyncio.to_thread(ftps.upload, dev.host, dev.access_code, local, name, progress, context=dev.trust.context())
+        try:
+            await asyncio.to_thread(ftps.upload, dev.host, dev.access_code, local, name, progress,
+                                    context=dev.trust.context())
+        finally:
+            stop.set()
         _set_step(app, job, m('Checking the file on the SD card'))
-        listing = await asyncio.to_thread(ftps.list_dir, dev.host, dev.access_code, "/", context=dev.trust.context())
-        size = next((e["size"] for e in listing if e["name"] == name), None)
+        entry = await _card_entry(dev, name)
+        size = entry["size"] if entry else None
         if size != local.stat().st_size:
             raise RuntimeError(m('File on the SD card is incomplete ({p0} of {p1} bytes)', p0=size, p1=local.stat().st_size))
         plan["uploaded"] = True
-        job.uploaded = name
+        job.uploaded, job.card_file = name, {"size": entry["size"], "modified": entry["modified"]}
         app[JOBS].save(job)
 
     _set_step(app, job, m('Starting the print'), None)
     command = build_project_file(plan.get("model_id") or dev.model_id, job.name, plan,
                                  print_url=config.print_url,
                                  capabilities=printer.status().get("printer", {}).get("capabilities"))
-    reply = await printer.command("print", command, wait=15)
-    if reply and str(reply.get("result", "")).lower() not in ("", "success", "ok"):
-        raise PrintRefused(m('The printer rejected the request: {p0}', p0=reply.get('reason') or reply.get('result')))
+    with _StartWatch(printer) as watch:
+        reply = await printer.command("print", command, wait=15)
+        if reply and str(reply.get("result", "")).lower() not in ("", "success", "ok"):
+            raise PrintRefused(m('The printer rejected the request: {p0}', p0=reply.get('reason') or reply.get('result')))
 
-    _set_step(app, job, m('Waiting for the print to start'))
-    deadline = time.monotonic() + START_CONFIRM_WAIT
-    while time.monotonic() < deadline:
-        state = printer.status()["job"]
-        if state["state"] in STARTED_STATES:
-            return reply
-        if state["state"] == "FAILED" and state.get("print_error"):
-            raise PrintRefused(m('The printer reports an error (code {p0:08X}).', p0=state['print_error']))
-        await asyncio.sleep(1)
+        _set_step(app, job, m('Waiting for the print to start'))
+        deadline = time.monotonic() + START_CONFIRM_WAIT
+        while time.monotonic() < deadline:
+            state = printer.status()["job"]
+            if state["state"] in STARTED_STATES:
+                subtask = state.get("subtask_id")
+                if subtask not in (None, "", "0") and subtask != watch.before["subtask_id"]:
+                    plan["subtask_id"] = subtask  # Identifies this print later, where the firmware sets one.
+                return reply
+            if code := watch.failure(state):
+                raise PrintRefused(m('The printer reports an error (code {p0:08X}).', p0=code))
+            await asyncio.sleep(START_POLL)
     raise RuntimeError(m('The printer did not confirm the print start'))
+
+
+class _StartWatch:
+    """Printer state changes after the print command, to tell a rejected start from the previous print's state.
+
+    FAILED counts as not printing, so a print may start while the printer still reports the previous print's
+    FAILED state and `print_error` (0300400C after a stop, until acknowledged). The reply to `project_file` often
+    arrives before the first status of the new job, so only an error that appears after the command counts:
+    `print_error` changed, or the printer left FAILED and returned to it."""
+
+    def __init__(self, printer: Printer):
+        self.printer = printer
+        job = printer.status()["job"]
+        self.before = {"print_error": job.get("print_error"), "subtask_id": job.get("subtask_id")}
+        self.changed = job["state"] != "FAILED"
+        self._stop = None
+
+    def __enter__(self) -> "_StartWatch":
+        self._stop = self.printer.subscribe(self._observe)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop()
+
+    def _observe(self) -> None:
+        job = self.printer.status()["job"]
+        if job["state"] != "FAILED" or job.get("print_error") != self.before["print_error"]:
+            self.changed = True
+
+    def failure(self, job: dict) -> int | None:
+        """The error code when the printer reports a failure of this start, else None."""
+        if job["state"] == "FAILED" and job.get("print_error") and self.changed:
+            return job["print_error"]
+        return None
 
 
 def _finish_print(app: web.Application, job: Job, *, reply: dict | None = None, error: str | None = None) -> None:
@@ -1640,6 +1990,8 @@ def _finish_print(app: web.Application, job: Job, *, reply: dict | None = None, 
                     "confirmed": True, "acknowledged": reply is not None}
         if plan.get("ams_mapping2") is not None:
             job.sent["ams_mapping2"] = plan["ams_mapping2"]
+        if plan.get("subtask_id"):
+            job.sent["subtask_id"] = plan["subtask_id"]
         if plan.get("plate") and plan["plate"] not in job.sent_plates:
             job.sent_plates = sorted([*job.sent_plates, plan["plate"]])
     job.pending, job.progress, job.step = None, None, None
@@ -1697,7 +2049,7 @@ async def _json_body(request: web.Request) -> Any:
 
 
 def _probe_problem(exc: ProbeError) -> Problem:
-    status = 422 if exc.code in ("access_code", "not_bambu") else 409 if exc.code in (
+    status = 422 if exc.code in ("access_code", "not_bambu", "not_local") else 409 if exc.code in (
         "certificate_changed", "other_printer") else 502
     return Problem(status, message_of(exc), code=exc.code)
 
@@ -1796,25 +2148,48 @@ async def delete_printer(request: web.Request) -> web.Response:
     return ok({"ok": True})
 
 
-# --- Live Activity ---
-
 # --- Filament library ---------------------------------------------------------------------------------------------
 
+# Spool plan retries per print: the SpoolTracker asks on every status update until it has a plan, and each attempt
+# may cost an FTPS session on the printer.
+PLAN_RETRY_FIRST = 30.0
+PLAN_RETRY_MAX = 600.0
+PLAN_ATTEMPTS = 10
+
+
 async def spool_plan(app: web.Application, dev: Device) -> Plan:
-    """Filaments of the printed plate and, for prints sent by the bridge, the filament → slot mapping."""
-    path, plate = await current_print_file(app, dev)
-    info = await asyncio.to_thread(read_slice_info, path)
+    """Filaments of the printed plate and, for prints sent by the bridge, the filament → slot mapping.
+
+    Both come from the same file and job (`current_print_file`). After a failure, wait 30 s, doubling up to
+    10 minutes, and give up after 10 attempts for this print."""
+    job = dev.printer.status()["job"]
+    if job.get("calibration"):
+        return [], None  # No file and nothing to book.
+    key = f"{job.get('name')}|{job.get('file')}"
+    retry = dev.plan_retry if dev.plan_retry and dev.plan_retry["key"] == key else None
+    if retry and (retry["attempts"] >= PLAN_ATTEMPTS or time.monotonic() < retry["at"]):
+        raise JobError(m('The print file is not available yet; trying again later.'))
+    try:
+        path, plate, source = await current_print_file(app, dev)
+        info = await asyncio.to_thread(read_slice_info, path)
+    except Exception as exc:
+        attempts = retry["attempts"] + 1 if retry else 1
+        dev.plan_retry = {"key": key, "attempts": attempts,
+                          "at": time.monotonic() + min(PLAN_RETRY_FIRST * 2 ** (attempts - 1), PLAN_RETRY_MAX)}
+        if attempts == 1:
+            log.info(m('No filament plan for print %s yet: %s'), job.get("name"), message_of(exc) or type(exc).__name__)
+        elif attempts == PLAN_ATTEMPTS:
+            log.info(m('No filament plan for print %s; filament use is not booked.'), job.get("name"))
+        raise
+    dev.plan_retry = None
     plates = info.get("plates") or []
     chosen = next((p for p in plates if p["index"] == plate), plates[0] if plates else None)
     filaments = chosen["filaments"] if chosen else []
-    job = dev.printer.status()["job"]
     mapping = None
-    for candidate in app[JOBS].list():
-        if candidate.sent and candidate.name == job.get("name") and candidate.printer in (None, dev.id):
-            slots = candidate.sent.get("ams_mapping") or []
-            # ams_mapping lists one slot per project filament (ID = position + 1); -1 = not used.
-            mapping = {i + 1: slot for i, slot in enumerate(slots) if isinstance(slot, int) and slot >= 0} or None
-            break
+    if source is not None:
+        slots = source.sent.get("ams_mapping") or []
+        # ams_mapping lists one slot per project filament (ID = position + 1); -1 = not used.
+        mapping = {i + 1: slot for i, slot in enumerate(slots) if isinstance(slot, int) and slot >= 0} or None
     return filaments, mapping
 
 
@@ -1825,39 +2200,65 @@ def _spool_reply(spool: dict | None, outcome: dict) -> dict:
     return reply
 
 
+async def _spool_body(request: web.Request) -> dict | web.Response:
+    try:
+        body = await request.json()
+    except ValueError:
+        return error(400, m('Invalid JSON.'))
+    return body if isinstance(body, dict) else error(400, m('Invalid JSON.'))
+
+
+def _tag_spool(request: web.Request, body: dict, printer: str | None, slot: int | None) -> web.Response:
+    """A tag read (`load`) or about to be written (`write`), for a slot or (`slot` None) in the library alone."""
+    uid, action, choice = body.get("uid"), body.get("action", "load"), body.get("choice", "auto")
+    if action not in ("load", "write") or choice not in ("auto", "restore", "new") or not isinstance(uid, str):
+        return error(422, m('Invalid spool request.'))
+    info = {key: body.get(key) for key in TAG_FIELDS}
+    store = request.app[SPOOLS]
+    try:
+        if action == "write":
+            spool, outcome = store.written(printer, slot, uid, weight=body.get("weight"),
+                                           remaining=body.get("remaining"), info=info)
+        else:
+            spool, outcome = store.load(printer, slot, uid, weight=body.get("weight"), remaining=body.get("remaining"),
+                                        info=info, choice=choice)
+    except (TypeError, ValueError):
+        return error(422, m('Invalid spool data (tag ID or amount).'))
+    # The printer whose slot shows the spool: the one it was read for, or where a known spool sits.
+    shown = printer or (spool or {}).get("printer")
+    if shown:
+        request.app[EVENTS].publish("status", {"printer": shown})
+    return ok(_spool_reply(spool, outcome))
+
+
 async def load_spool(request: web.Request) -> web.Response:
     """A spool with an NFC tag in a slot: `{"slot", "uid", "action": "load"|"write", "choice": "auto"|"restore"|"new",
     "weight", "remaining", "type", "brand", "subtype", "color", "nozzle_temp_min", "nozzle_temp_max"}`.
 
     `load` (tag read): known spools keep the counted amount; for a deleted spool the reply may be
     `{"decision": "choose", "suggest": "new"|"restore", "deleted": {…}}` and the app asks again with a choice.
-    `write` (tag about to be written): same filament keeps the amount, otherwise a new full spool. The reply's
-    `spool.remaining` is what the app writes to the tag."""
-    try:
-        body = await request.json()
-    except ValueError:
-        return error(400, m('Invalid JSON.'))
-    if not isinstance(body, dict):
-        return error(400, m('Invalid JSON.'))
+    `write` (tag about to be written): same filament keeps the amount, otherwise a new spool that starts with
+    `remaining`, else full. The reply's `spool.remaining` is what the app writes to the tag."""
+    body = await _spool_body(request)
+    if isinstance(body, web.Response):
+        return body
     dev = device(request)
-    slot, uid = body.get("slot"), body.get("uid")
-    action, choice = body.get("action", "load"), body.get("choice", "auto")
+    slot = body.get("slot")
     if not isinstance(slot, int) or controls.find_tray(dev.printer.status(), slot) is None:
         return error(422, m('Slot not found.'))
-    if action not in ("load", "write") or choice not in ("auto", "restore", "new") or not isinstance(uid, str):
-        return error(422, m('Invalid spool request.'))
-    info = {key: body.get(key) for key in ("type", "brand", "subtype", "color", "nozzle_temp_min", "nozzle_temp_max")}
-    store = request.app[SPOOLS]
-    try:
-        if action == "write":
-            spool, outcome = store.written(dev.id, slot, uid, weight=body.get("weight"), info=info)
-        else:
-            spool, outcome = store.load(dev.id, slot, uid, weight=body.get("weight"), remaining=body.get("remaining"),
-                                        info=info, choice=choice)
-    except (TypeError, ValueError):
-        return error(422, m('Invalid spool data (tag ID or amount).'))
-    request.app[EVENTS].publish("status", {"printer": dev.id})
-    return ok(_spool_reply(spool, outcome))
+    response = _tag_spool(request, body, dev.id, slot)
+    if response.status == 200 and dev.new_spools is not None:
+        dev.new_spools.user_set(slot)  # A tag read for the slot: no Generic setting, and the new spool hint ends.
+    return response
+
+
+async def add_spool(request: web.Request) -> web.Response:
+    """A spool with an NFC tag added in the filament library, without a slot: the body of `POST /api/ams/spool`
+    without `slot`, with the same decisions. A new spool stays unloaded; a known one stays where it is."""
+    body = await _spool_body(request)
+    if isinstance(body, web.Response):
+        return body
+    return _tag_spool(request, body, None, None)
 
 
 async def list_spools(request: web.Request) -> web.Response:
@@ -1879,12 +2280,16 @@ async def update_spool(request: web.Request) -> web.Response:
         return error(400, m('Invalid JSON.'))
     if not isinstance(body, dict):
         return error(400, m('Invalid JSON.'))
-    note = body.get("note")
+    note, unload = body.get("note"), body.get("unload", False)
+    if not (note is None or isinstance(note, str)) or not isinstance(unload, bool):
+        return error(422, m('Invalid spool data (tag ID or amount).'))
     try:
         spool = request.app[SPOOLS].update(request.match_info["spool_id"], remaining=body.get("remaining"),
-                                           note=note if isinstance(note, str) else None, unload=body.get("unload") is True)
-    except (TypeError, ValueError):
+                                           note=note, unload=unload)
+    except BambuAmount:
         return error(422, m('The AMS reports the amount of Bambu spools; it cannot be changed here.'))
+    except (TypeError, ValueError):
+        return error(422, m('Invalid spool data (tag ID or amount).'))
     if spool is None:
         return error(404, m('Spool not found.'))
     if spool.get("printer"):
@@ -1899,6 +2304,8 @@ async def delete_spool(request: web.Request) -> web.Response:
         return error(404, m('Spool not found.'))
     return web.Response(status=204, headers={"Cache-Control": "no-store"})
 
+
+# --- Live Activity ---
 
 async def live_status(request: web.Request) -> web.Response:
     live = device(request).live
@@ -1915,10 +2322,11 @@ INSTALLATION = re.compile(r"[0-9A-Fa-f-]{8,64}")
 
 async def live_register(request: web.Request) -> web.Response:
     """Register an app token: {"kind": "start"|"update"|"alert", "token": "<hex>",
-    "environment": "development"|"production", "activity_id": "…", "printer": "<id>",
+    "environment": "development"|"production", "activity_id": "…", "printer": "<printerId>",
     "installation": "…", "events": [...], "language": "en"|"de"}. Start tokens apply to all printers;
-    update tokens belong to one printer's Live Activity (default printer if omitted); alert tokens
-    receive the requested notification events (an empty list unregisters). Language defaults to English."""
+    update tokens belong to one printer's Live Activity (the activity's `printerId` attribute; the default printer
+    if omitted); alert tokens receive the requested notification events (an empty list unregisters). Language
+    defaults to English."""
     try:
         body = await request.json()
     except ValueError:
@@ -1940,10 +2348,10 @@ async def live_register(request: web.Request) -> web.Response:
     printer_id = body.get("printer")
     devices = request.app[DEVICES].devices
     if kind == "update":
+        # The activity's `printerId` attribute (`public_printer_id`), or the default printer.
         if printer_id is None:
             printer_id = request.app[DEVICES].default_id
-        if printer_id not in devices:
-            # Newer apps use the derived attributes ID instead of the serial number.
+        else:
             printer_id = next((serial for serial in devices if public_printer_id(serial) == printer_id), None)
         if printer_id not in devices:
             return error(422, m('Printer not found.'))
@@ -1951,11 +2359,25 @@ async def live_register(request: web.Request) -> web.Response:
     if installation is not None and not (isinstance(installation, str) and INSTALLATION.fullmatch(installation)):
         return error(422, m('Invalid installation ID.'))
     principal = request[PRINCIPAL]
-    request.app[PUSH].add(kind, token.lower(), environment, activity_id if isinstance(activity_id, str) else None,
-                          printer_id or "", device=principal.device_id or SHARED_DEVICE,
-                          installation=installation.upper() if installation else None,
-                          events=list(dict.fromkeys(events)) if kind == "alert" else None, language=language)
+    added = request.app[PUSH].add(kind, token.lower(), environment, activity_id if isinstance(activity_id, str) else None,
+                                  printer_id or "", device=principal.device_id or SHARED_DEVICE,
+                                  installation=installation.upper() if installation else None,
+                                  events=list(dict.fromkeys(events)) if kind == "alert" else None, language=language)
+    if not added:
+        return error(409, m('This push token is registered by another paired device.'))
     return ok({"registered": kind})
+
+
+async def live_unregister(request: web.Request) -> web.Response:
+    """`DELETE /api/live/register?installation=<ID>`: remove the start, update and alert registrations this
+    installation made with the calling credential (its device, or the shared access key), for example when the app
+    leaves this bridge. Returns `{"removed": n}`."""
+    installation = request.query.get("installation", "")
+    if not INSTALLATION.fullmatch(installation):
+        return error(422, m('Invalid installation ID.'))
+    principal = request[PRINCIPAL]
+    removed = request.app[PUSH].remove_installation(principal.device_id or SHARED_DEVICE, installation.upper())
+    return ok({"removed": removed})
 
 
 # --- Construction ---
@@ -1983,7 +2405,7 @@ PRINTER_ROUTES = (
     ("POST", "/ams/spool", "load_spool"),
 )
 
-ENV_RETRY = 30.0  # Number of attempts to read the environment printer's serial number.
+ENV_RETRY = 30.0  # Seconds between attempts to read the environment printer's serial number.
 
 
 def env_settings(config: Config) -> PrinterSettings | None:
@@ -1994,25 +2416,29 @@ def env_settings(config: Config) -> PrinterSettings | None:
 
 
 async def _add_env_printer(app: web.Application, settings: PrinterSettings) -> None:
-    """Environment printer without `BAMBU_SERIAL`: repeatedly read its serial number from the certificate."""
+    """Environment printer not enrolled yet (no `BAMBU_SERIAL`, first start or new access code): read serial
+    number and certificate from the printer, retrying until it answers, and enroll both (`PrinterStore.resolve_env`)."""
     while True:
         try:
-            settings.serial = await read_serial(settings.host)
+            settings.serial, seen = await read_identity(settings.host)
             break
         except ProbeError as exc:
             log.warning(m('Printer from BAMBU_HOST: %s Retrying in %.0f s.'), exc, ENV_RETRY)
             await asyncio.sleep(ENV_RETRY)
     devices = app[DEVICES]
-    devices.devices.pop(settings.serial, None)  # Environment configuration takes precedence over the same stored printer.
-    devices.add_device(Device(settings, devices.catalogs, devices.models, trust=devices.store.trust(settings.serial)),
-                       env=True)
+    devices.store.enroll_env(settings.serial, settings.access_code, fingerprint=seen,
+                             renew=devices.store.env is not None)
+    await devices.add_env(settings)
+    assign_unowned_jobs(app)
 
 
 def create_app(config: Config, *, printer: Printer | None = None, camera: Camera | None = None,
                catalog: Catalog | None = None, live: LiveActivities | None = None, probe_fn=None,
                identity: BridgeIdentity | None = None, tls_state: TLSState | None = None,
                pairing_store: PairingStore | None = None, start_background: bool = True) -> web.Application:
-    app = web.Application(middlewares=[language_middleware, transport_middleware, auth_middleware], client_max_size=(config.max_upload_mb + 1) * 1024 * 1024)
+    # Model uploads read their multipart stream with their own limit (`upload_job`); all other bodies are small.
+    app = web.Application(middlewares=[language_middleware, transport_middleware, auth_middleware],
+                          client_max_size=JSON_BODY_LIMIT)
     app[CONFIG] = config
     app[IDENTITY] = identity or load_identity(config.auth_dir / "bridge.json", config.bridge_name)
     app[TLS] = tls_state or TLSState(None, None)
@@ -2021,13 +2447,14 @@ def create_app(config: Config, *, printer: Printer | None = None, camera: Camera
     if catalog is not None:
         catalogs.put(catalog)
     app[CATALOGS] = catalogs
-    devices = Devices(PrinterStore(config.data_dir / "printers.json"), catalogs, Models(config.models_dir))
+    devices = Devices(PrinterStore(config.data_dir / "printers.json"), catalogs, Models(config.models_dir),
+                      bridge_id=app[IDENTITY].id)
     app[DEVICES] = devices
     app[SLICER] = Slicer(config.orca_cmd, config.slice_timeout)
     app[JOBS] = JobStore(config.data_dir, config.keep_jobs)
     app[EVENTS] = EventHub()
     app[TASKS] = set()
-    app[PREVIEW_LOCKS] = {}
+    app[UPLOADS] = asyncio.Semaphore(MAX_UPLOADS)
     app[HMS] = Texts(config.hms_dir)
     app[PROBE] = probe_fn or probe
     apns = APNsConfig.load(config.apns_key_file, config.apns_key_id, config.apns_team_id, config.apns_bundle_id)
@@ -2035,6 +2462,9 @@ def create_app(config: Config, *, printer: Printer | None = None, camera: Camera
     app[APNS] = APNsClient(apns) if apns else (
         RelayClient(config.push_relay, config.data_dir / "relay.json") if config.push_relay else None)
     app[PUSH] = live.registry if live is not None else Registry(config.data_dir / "push.json")
+    # Pushes only reach devices that are still paired, and shared-key registrations only the current key.
+    app[PUSH].bind(lambda device_id, auth=app[AUTH]: any(d.id == device_id for d in auth.devices),
+                   app[AUTH].legacy_secret)
     app[SPOOLS] = SpoolStore(config.data_dir / "spools.json")
     warming: set[str] = set()
 
@@ -2044,22 +2474,35 @@ def create_app(config: Config, *, printer: Printer | None = None, camera: Camera
             dev.live.observe(described_status(app, dev))
         if dev.spools is not None:
             dev.spools.observe(dev.printer.status())
+        if dev.new_spools is not None:
+            dev.new_spools.observe()
         machine = dev.machine_profile
         # Load the catalog once model and nozzle are known (status then includes flow calibration support).
         if machine and catalogs.cached(machine) is None and machine not in warming:
             warming.add(machine)
             task = asyncio.get_running_loop().create_task(catalogs.get(machine))
-            task.add_done_callback(lambda t, m=machine: (warming.discard(m), t.cancelled() or t.exception()))
+            app[TASKS].add(task)
+            # Catalogs.get logs a failure once and retries it later.
+            task.add_done_callback(lambda t, m=machine: (warming.discard(m), app[TASKS].discard(t),
+                                                         t.cancelled() or t.exception()))
 
     def wire(dev: Device) -> None:
         if dev.live is None:
             first = not any(d.live for d in devices.devices.values() if d is not dev)
             dev.live = live if (live is not None and first) else LiveActivities(
                 app[APNS], app[PUSH], lambda pid=dev.id: devices.devices[pid].name if pid in devices.devices else m('Printer'),
-                dev.id, adopt=first)
+                dev.id)
         if dev.spools is None:
             dev.spools = SpoolTracker(app[SPOOLS], dev.id, lambda d=dev: spool_plan(app, d),
                                       lambda d=dev: app[EVENTS].publish("status", {"printer": d.id}))
+        if dev.new_spools is None:
+            def reset(d: Device = dev) -> None:
+                # A Generic setting went out: show the flag, and ask again later like after `/api/ams/tray`.
+                app[EVENTS].publish("status", {"printer": d.id})
+                _pushall_later(d.printer, AMS_SETTING_PUSHALL)
+            dev.new_spools = NewSpoolWatcher(
+                dev.printer, dev.catalog, enabled=config.reset_new_spools,
+                placed=lambda slot, d=dev: (app[SPOOLS].at(d.id, slot) or {}).get("placed"), changed=reset)
         dev.printer.subscribe(lambda d=dev: changed(d))
 
     devices.on_added.append(wire)
@@ -2074,12 +2517,16 @@ def create_app(config: Config, *, printer: Printer | None = None, camera: Camera
         devices.load()
     else:
         env = env_settings(config)
-        if env is not None and not env.serial:
-            pending_env, env = env, None
+        if env is not None:
+            env.serial = devices.store.resolve_env(env) or ""
+            if not env.serial:
+                pending_env, env = env, None
         devices.load(env)
+    assign_unowned_jobs(app)
 
     app.router.add_get("/", home)
     app.router.add_post("/invite", web_invite)
+    app.router.add_post("/setup", web_setup)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/api/pair", pair)
     app.router.add_post("/api/pairing", create_invitation)
@@ -2096,13 +2543,15 @@ def create_app(config: Config, *, printer: Printer | None = None, camera: Camera
     app.router.add_patch("/api/printers/{printer_id}", update_printer)
     app.router.add_delete("/api/printers/{printer_id}", delete_printer)
     app.router.add_get("/api/printers/{printer_id}/jobs", list_jobs)
-    app.router.add_post("/api/printers/{printer_id}/jobs", upload_job)
+    app.router.add_post("/api/printers/{printer_id}/jobs", limited_upload)
     app.router.add_post("/api/live/register", live_register)
+    app.router.add_delete("/api/live/register", live_unregister)
     app.router.add_get("/api/spools", list_spools)
+    app.router.add_post("/api/spools", add_spool)
     app.router.add_patch("/api/spools/{spool_id}", update_spool)
     app.router.add_delete("/api/spools/{spool_id}", delete_spool)
     app.router.add_get("/api/jobs", list_jobs)
-    app.router.add_post("/api/jobs", upload_job)
+    app.router.add_post("/api/jobs", limited_upload)
     app.router.add_get("/api/jobs/{job_id}", get_job)
     app.router.add_delete("/api/jobs/{job_id}", delete_job)
     app.router.add_post("/api/jobs/{job_id}/slice", slice_job)
@@ -2128,26 +2577,34 @@ def create_app(config: Config, *, printer: Printer | None = None, camera: Camera
             log.info(m('Printer: %s'), ", ".join(f"{d.name} ({d.host})" for d in devices.list()) or
                      (m('read from BAMBU_HOST') if pending_env else m('none configured yet')))
             if not app[TLS].enabled and not config.trusted_proxies:
-                log.warning(m('BRIDGE_TLS=off without BRIDGE_TRUSTED_PROXIES: The API is accessible over HTTP to every device on the network. Behind a reverse proxy, add its addresses to BRIDGE_TRUSTED_PROXIES.'))
+                log.warning(m('BRIDGE_PLAIN_HTTP=on: The API, pairing codes and tokens travel over plain HTTP and every device on the network can reach them. Behind a reverse proxy, set BRIDGE_TRUSTED_PROXIES instead.'))
             log.info("Live Activity: %s", m('own APNs key') if apns else
-                     m('via relay {p0}', p0=config.push_relay) if app[APNS] else "aus")
+                     m('via relay {p0}', p0=config.push_relay) if app[APNS] else "off")
             log.info("Error texts: %s", "loaded" if app[HMS].available else f"missing in {config.hms_dir}")
-            if app[AUTH].setup_code:
-                log.info(m('Setup code: %s'), display_code(app[AUTH].setup_code))
+            log.info(m('Bridge %s (ID %s), paired devices: %d'), app[IDENTITY].name, app[IDENTITY].id,
+                     len(app[AUTH].devices))
+            if tls.enabled and tls.fingerprint:
+                # Bambro shows the same groups before sending a code to an address typed in or found on the network.
+                log.info(m('Certificate fingerprint: %s'), grouped_fingerprint(tls.fingerprint))
+            if app[AUTH].setup_open:
+                log.info(m('Setup code for the first device: %s (valid for %d minutes; restart the bridge for a new one)'),
+                         display_code(app[AUTH].setup_code), (app[AUTH].setup_remaining + 59) // 60)
             elif config.bridge_token:
                 log.info(m('Pairing: Fixed access key or an invitation from a paired device'))
             resume_pending_prints(app)
             yield
-            if env_task:
-                env_task.cancel()
+            # Background work first (slicing, print sending, the environment printer, status refreshes), while the
+            # printers, APNs and pairing it may use are still open; accepted prints resume after the restart.
+            pending = [task for task in (env_task, *app[TASKS], *_background) if task is not None]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             await devices.stop()
             if app[APNS]:
                 await app[APNS].close()
             await app[AUTH].close()
             if advertiser:
                 await advertiser.stop()
-            for pending in list(app[TASKS]):
-                pending.cancel()
         app.cleanup_ctx.append(background)
     else:
         async def pairing_cleanup(app: web.Application):

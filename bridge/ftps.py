@@ -61,7 +61,8 @@ def _connect(host: str, access_code: str, timeout: float, context: ssl.SSLContex
 def upload(host: str, access_code: str, local: Path, remote_name: str,
            progress: Callable[[int, int], None] | None = None, timeout: float = 60,
            context: ssl.SSLContext | None = None) -> None:
-    """Upload `local` as `/<remote_name>`; blocking, call via asyncio `to_thread`."""
+    """Upload `local` as `/<remote_name>`; blocking, call via asyncio `to_thread`. An exception raised by
+    `progress` aborts the upload."""
     total = local.stat().st_size
     sent = 0
 
@@ -76,10 +77,7 @@ def upload(host: str, access_code: str, local: Path, remote_name: str,
         with local.open("rb") as handle:
             ftp.storbinary(f"STOR /{remote_name}", handle, blocksize=64 * 1024, callback=chunk)
     finally:
-        try:
-            ftp.quit()
-        except (OSError, EOFError, ftplib.Error):
-            ftp.close()
+        _close(ftp)
 
 
 def _close(ftp: ImplicitFTPS) -> None:
@@ -141,10 +139,19 @@ def parse_list_line(line: str) -> dict | None:
     return {"name": parts[8], "size": size, "is_dir": parts[0][0] == "d", "modified": modified}
 
 
-def download(host: str, access_code: str, remote_path: str, local: Path,
-             progress: Callable[[int], None] | None = None, timeout: float = 60,
-             context: ssl.SSLContext | None = None) -> None:
-    """Download an SD card file; blocking, call via asyncio `to_thread`."""
+class TooLarge(Exception):
+    """The SD card file is larger than allowed; the download was stopped."""
+
+    def __init__(self, limit: int):
+        super().__init__(f"more than {limit} bytes")
+        self.limit = limit
+
+
+def download(host: str, access_code: str, remote_path: str, local: Path, timeout: float = 60,
+             context: ssl.SSLContext | None = None, limit: int | None = None) -> None:
+    """Download an SD card file; blocking, call via asyncio `to_thread`.
+
+    With `limit`, stop with `TooLarge` as soon as more bytes arrive, before they reach the disk."""
     ftp = _connect(host, access_code, timeout, context)
     received = 0
     tmp = local.with_suffix(local.suffix + ".part")
@@ -152,10 +159,10 @@ def download(host: str, access_code: str, remote_path: str, local: Path,
         with tmp.open("wb") as handle:
             def chunk(block: bytes) -> None:
                 nonlocal received
-                handle.write(block)
                 received += len(block)
-                if progress:
-                    progress(received)
+                if limit is not None and received > limit:
+                    raise TooLarge(limit)
+                handle.write(block)
             ftp.retrbinary(f"RETR {remote_path}", chunk, blocksize=64 * 1024)
         tmp.replace(local)
     finally:
