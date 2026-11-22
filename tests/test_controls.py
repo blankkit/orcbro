@@ -115,6 +115,29 @@ class FilamentTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             build("unload", None, nothing)
 
+    def test_read_rfid(self):
+        idle = status_with(gcode_state="IDLE")
+        idle["ams"]["active_slot"] = 3
+        (_, body), = build("read_rfid", 2, idle)
+        self.assertEqual(body, {"command": "ams_get_rfid", "ams_id": 0, "slot_id": 2})
+        with self.assertRaises(ControlError) as loaded:
+            build("read_rfid", 3, idle)  # In the toolhead: the AMS cannot turn the spool.
+        self.assertEqual(loaded.exception.status, 409)
+        with self.assertRaises(ControlError):
+            build("read_rfid", 254, idle)  # External spool: no chip reader.
+        with self.assertRaises(ControlError):
+            build("read_rfid", 2, status_with(gcode_state="RUNNING"))
+
+    def test_read_rfid_on_older_firmware_uses_gcode(self):
+        idle = status_with(gcode_state="IDLE")
+        idle["ams"]["active_slot"] = None
+        idle["printer"] = {**(idle.get("printer") or {}), "model_id": "C12", "firmware": "01.07.00.00"}
+        (_, body), = build("read_rfid", 2, idle)
+        self.assertEqual(body, {"command": "gcode_line", "param": "M620 R2 \n"})
+        idle["printer"]["firmware"] = "01.10.00.00"
+        (_, body), = build("read_rfid", 2, idle)
+        self.assertEqual(body["command"], "ams_get_rfid")
+
     def test_tray_setting(self):
         info = {"bambu_id": "GFA00", "type": "PLA", "nozzle_temp_min": 190, "nozzle_temp_max": 230}
         section, body = tray_setting(1, info, "#3f8e43")
@@ -125,6 +148,28 @@ class FilamentTests(unittest.TestCase):
         self.assertEqual((ext["ams_id"], ext["tray_id"]), (255, 254))
         with self.assertRaises(ControlError):
             tray_setting(1, info, "grün")
+        self.assertNotIn("cols", body)
+
+    def test_tray_setting_clear_and_multicolor(self):
+        info = {"bambu_id": "GFL99", "type": "PLA"}
+        _, clear = tray_setting(0, info, "#00000000")
+        self.assertEqual(clear["tray_color"], "00000000")
+        _, translucent = tray_setting(0, info, "#FF6A1380")
+        self.assertEqual(translucent["tray_color"], "FF6A1380")
+        # Printers without the capability keep the first color and get the legacy command.
+        _, legacy = tray_setting(0, info, "", colors=["#E94B3C", "#FFFFFF"], gradient=True)
+        self.assertEqual(legacy["tray_color"], "E94B3CFF")
+        self.assertNotIn("cols", legacy)
+        _, gradient = tray_setting(0, info, "", colors=["#E94B3C", "#FFFFFF"], gradient=True, multi_color=True)
+        self.assertEqual((gradient["cols"], gradient["ctype"]), (["E94B3CFF", "FFFFFFFF"], 0))
+        _, segments = tray_setting(0, info, "", colors=["#FF0000", "#00FF00", "#0000FF"], multi_color=True)
+        self.assertEqual((segments["tray_color"], segments["ctype"]), ("FF0000FF", 1))
+        _, single = tray_setting(0, info, "#3F8E43", multi_color=True)
+        self.assertEqual((single["cols"], single["ctype"]), (["3F8E43FF"], 2))
+        with self.assertRaises(ControlError):
+            tray_setting(0, info, "", colors=["#FF0000", "grün"], multi_color=True)
+        with self.assertRaises(ControlError):
+            tray_setting(0, info, "", colors=["#FF0000"] * 5, multi_color=True)
 
     def test_load_temp(self):
         self.assertEqual(controls.load_temp(None), 220)

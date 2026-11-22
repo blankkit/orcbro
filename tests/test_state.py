@@ -161,3 +161,41 @@ class PrinterFlagTests(unittest.TestCase):
         without_ams = normalize({"home_flag": 16}, connected=True, last_message_at=None, printer=PRINTER)["options"]
         self.assertEqual(without_ams, {"auto_recovery": True, "ams_backup": None, "rfid_on_startup": None,
                                        "rfid_on_insert": None, "remain_estimate": None})
+
+
+class BareTrayTests(unittest.TestCase):
+    """The P1 series reports a removed spool as a bare `{"id": n}`; the old fields must not linger."""
+
+    def test_bare_slot_replaces_the_old_spool(self):
+        from bridge.printer import Printer
+        printer = Printer("h", "s", "c")
+        printer.handle(load("pushall_p1s.json"))
+        before = next(t for t in printer.status()["ams"]["units"][0]["trays"] if t["slot"] == 2)
+        self.assertFalse(before["empty"])
+        printer.handle({"print": {"command": "push_status", "ams": {
+            "tray_exist_bits": "f", "ams": [{"id": "0", "tray": [{"id": "2"}]}]}}})
+        tray = next(t for t in printer.status()["ams"]["units"][0]["trays"] if t["slot"] == 2)
+        self.assertTrue(tray["empty"])
+        self.assertFalse(tray["rfid"])
+        self.assertIsNone(tray["spool_uuid"])
+        self.assertTrue(tray["present"])  # A spool is in the slot, its filament is unknown.
+        # Partial updates with more fields still merge into the slot.
+        printer.handle({"print": {"command": "push_status", "ams": {"tray_exist_bits": "b", "ams": [{"id": "0", "tray": [
+            {"id": "1", "remain": 42}]}]}}})
+        trays = {t["slot"]: t for t in printer.status()["ams"]["units"][0]["trays"]}
+        self.assertEqual(trays[1]["remain"], 42)
+        self.assertIsNotNone(trays[1]["material"])
+        self.assertFalse(trays[2]["present"])
+
+    def test_multicolor_slot(self):
+        from bridge.printer import Printer
+        printer = Printer("h", "s", "c")
+        printer.handle(load("pushall_p1s.json"))
+        printer.handle({"print": {"command": "push_status", "ams": {"ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_type": "PLA", "tray_color": "E94B3CFF", "cols": ["E94B3CFF", "FFFFFFFF"], "ctype": 0},
+            {"id": "1", "tray_type": "PLA", "tray_color": "FF0000FF", "cols": ["FF0000FF", "00FF00FF"], "ctype": 1}]}]}}})
+        status = printer.status()
+        trays = {t["slot"]: t for t in status["ams"]["units"][0]["trays"]}
+        self.assertEqual(trays[0]["colors"], ["#E94B3CFF", "#FFFFFFFF"])
+        self.assertTrue(trays[0]["gradient"])
+        self.assertFalse(trays[1]["gradient"])

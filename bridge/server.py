@@ -533,7 +533,23 @@ async def control(request: web.Request) -> web.Response:
     if action in ("light", "speed", "skip_objects", "load", "unload", "option", "calibrate", "dry", "dry_stop"):
         # The printer reports the new state with its next full push.
         await printer.pushall(force=True)
+    if action == "read_rfid":
+        # Reading takes about 20 seconds (the AMS turns the spool); fetch the result afterwards.
+        task = asyncio.create_task(_pushall_after(printer, (25, 60)))
+        _background.add(task)
+        task.add_done_callback(_background.discard)
     return ok({"ok": True})
+
+
+_background: set[asyncio.Task] = set()
+
+
+async def _pushall_after(printer, delays: tuple[int, ...]) -> None:
+    waited = 0
+    for delay in delays:
+        await asyncio.sleep(delay - waited)
+        waited = delay
+        await printer.pushall(force=True)
 
 
 DRY_FALLBACK = {"temperature": 45, "hours": 4}  # Empty AMS or no filament presets: use conservative defaults.
@@ -615,7 +631,7 @@ async def _clear_error(printer: Printer, status: dict) -> web.Response:
 
 
 async def set_tray(request: web.Request) -> web.Response:
-    """Set AMS slot: {"slot": n, "filament": "<profile name>", "color": "#RRGGBB"}."""
+    """Set AMS slot: {"slot": n, "filament": "<profile name>", "color": "#RRGGBB[AA]", "colors"?, "gradient"?}."""
     try:
         body = await request.json()
     except ValueError:
@@ -635,7 +651,12 @@ async def set_tray(request: web.Request) -> web.Response:
         return error(409, m('This slot is currently being used for printing.'))
     try:
         info = (await catalog_of(dev)).filament_info(str(name))
-        section, command = controls.tray_setting(slot, info, str(color or ""), tray.get("source"))
+        colors = body.get("colors")
+        if colors is not None and not isinstance(colors, list):
+            return error(422, m('Color as #RRGGBB.'))
+        capabilities = status.get("printer", {}).get("capabilities") or {}
+        section, command = controls.tray_setting(slot, info, str(color or ""), tray.get("source"), colors,
+                                                 bool(body.get("gradient")), bool(capabilities.get("multi_color")))
         await printer.command(section, command)
     except ProfileError as exc:
         return error(422, message_of(exc))

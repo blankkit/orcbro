@@ -6,6 +6,7 @@ Network-free logic keeps every rule testable:
 - Objects can be skipped only while printing, only known IDs, and never all objects.
 - Print options and message acknowledgment are always allowed, as in Bambu Studio.
 - Calibration requires no running print because the printer moves, heats and vibrates.
+- Reading a spool chip again requires no running print and no filament from that slot in the toolhead.
 - Drying requires a heated AMS (AMS 2 Pro or AMS HT), remote firmware support, the AMS temperature
   limits, and temperatures below the loaded filament's heat distortion temperature.
 Commands follow the LAN Only mode protocol used by OrcaSlicer and Bambu Studio."""
@@ -15,6 +16,7 @@ from .i18n import m, join_messages
 
 from dataclasses import dataclass
 
+from .models import _version
 from .state import EXTERNAL_SLOT
 
 # Exclude UNKNOWN: do not move until the printer has reported its state.
@@ -26,6 +28,11 @@ BED_MAX = 100
 FANS = {"part": 1, "aux": 2, "chamber": 3}
 AXES = {"X": (100, 3000), "Y": (100, 3000), "Z": (50, 600)}  # Maximum move in mm, feed rate in mm/min.
 MIN_EXTRUDE_TEMP = 170
+# Firmware from which these models read an AMS chip again with `ams_get_rfid`; older firmware (and the X1E, whose
+# support is unknown) only takes the G-code `M620 R<tray>`. Same split as ha-bambulab; newer models always use JSON.
+RFID_COMMAND_SINCE = {"C11": "01.08.01.00", "C12": "01.08.01.00", "BL-P001": "01.09.00.00", "BL-P002": "01.09.00.00",
+                      "N1": "01.06.00.00", "N2S": "01.06.00.00"}
+RFID_GCODE_ONLY = {"C13"}
 
 
 @dataclass
@@ -161,6 +168,15 @@ def build(action: str, value, status: dict, objects: list[dict] | None = None,
         temp = load_temp(current)
         return [("print", {"command": "ams_change_filament", "ams_id": ams_id, "slot_id": 255, "target": 255,
                            "curr_temp": temp, "tar_temp": temp})]
+    if action == "read_rfid":
+        # Bambu: spools inserted during a print are read only after it; a loaded spool cannot be turned.
+        need(IDLE, m('The AMS reads spool chips only when no print is running.'))
+        tray = find_tray(status, value)
+        if tray is None or tray.get("ams") is None:
+            raise ControlError(422, m('Slot not found or external spool (it has no chip reader).'))
+        if tray["slot"] == status["ams"].get("active_slot"):
+            raise ControlError(409, m('Filament from this slot is in the toolhead. Unload it first.'))
+        return [rfid_read(tray, status.get("printer") or {})]
     if action == "skip_objects":
         need({"RUNNING", "PAUSE"}, m('You can only skip objects while printing.'))
         if not isinstance(value, list) or not value or not all(isinstance(i, int) for i in value):
@@ -312,13 +328,17 @@ def clear_error(status: dict) -> tuple[Command, Command]:
                         "err": f"{value:08X}"}))
 
 
-def tray_setting(slot: int, info: dict, color: str, source: dict | None = None) -> Command:
-    """Assign filament and color to an AMS slot or external spool: `ams_filament_setting`."""
-    hex_color = color.lstrip("#").upper()
-    if len(hex_color) == 6:
-        hex_color += "FF"
-    if len(hex_color) != 8 or any(c not in "0123456789ABCDEF" for c in hex_color):
-        raise ControlError(422, m('Color as #RRGGBB.'))
+def tray_setting(slot: int, info: dict, color: str, source: dict | None = None, colors: list | None = None,
+                 gradient: bool = False, multi_color: bool = False) -> Command:
+    """Assign filament and color to an AMS slot or external spool: `ams_filament_setting`.
+
+    Colors are `#RRGGBB` or `#RRGGBBAA`; Bambu uses alpha `00` for clear and `80` for translucent filament.
+    `colors` (two or more) describes a multicolor spool as segments or, with `gradient`, as a gradient. Only
+    printers with `multi_color` store them (`cols`/`ctype`, as in Bambu Studio); others keep the first color.
+    """
+    shades = [_rgba(c) for c in colors or []] or [_rgba(color)]
+    if len(shades) > 4:
+        raise ControlError(422, m('At most four colors per spool.'))
     if source and source.get("ams_id") not in (0, 1, 2, 3, 255):
         raise ControlError(409, m('This AMS slot cannot be changed safely with the verified write protocol.'))
     if source:
@@ -330,12 +350,26 @@ def tray_setting(slot: int, info: dict, color: str, source: dict | None = None) 
         ams_id, slot_id, tray_id = slot // 4, slot % 4, slot % 4
     else:
         raise ControlError(422, m('Invalid slot.'))
-    return ("print", {
+    body = {
         "command": "ams_filament_setting", "ams_id": ams_id, "slot_id": slot_id, "tray_id": tray_id,
-        "tray_info_idx": info.get("bambu_id") or "", "setting_id": "", "tray_color": hex_color,
+        "tray_info_idx": info.get("bambu_id") or "", "setting_id": "", "tray_color": shades[0],
         "nozzle_temp_min": info.get("nozzle_temp_min") or 190, "nozzle_temp_max": info.get("nozzle_temp_max") or 240,
         "tray_type": info.get("type") or "PLA",
-    })
+    }
+    if multi_color:
+        body["cols"] = shades
+        body["ctype"] = 2 if len(shades) == 1 else 0 if gradient else 1
+    return ("print", body)
+
+
+def _rgba(color) -> str:
+    """`#RRGGBB` or `#RRGGBBAA` → printer `RRGGBBAA`."""
+    hex_color = str(color or "").lstrip("#").upper()
+    if len(hex_color) == 6:
+        hex_color += "FF"
+    if len(hex_color) != 8 or any(c not in "0123456789ABCDEF" for c in hex_color):
+        raise ControlError(422, m('Color as #RRGGBB.'))
+    return hex_color
 
 
 def nozzle_text(diameter) -> str:
@@ -397,6 +431,16 @@ def k_select(slot, tray: dict, cali_idx, diameter) -> Command:
         raise ControlError(422, m('Invalid slot.'))
     return ("print", {"command": "extrusion_cali_sel", "tray_id": tray_id, "ams_id": ams_id, "slot_id": slot_id,
                       "cali_idx": cali_idx, "filament_id": filament_id, "nozzle_diameter": nozzle_text(diameter)})
+
+
+def rfid_read(tray: dict, printer: dict) -> Command:
+    """Read the chip of one AMS slot again (Bambu Studio's refresh). A spool without a chip ends up blank, ready to be
+    set by hand."""
+    model, firmware = printer.get("model_id"), printer.get("firmware")
+    since = RFID_COMMAND_SINCE.get(model)
+    if model in RFID_GCODE_ONLY or since and firmware and _version(firmware) < _version(since):
+        return gcode(f"M620 R{tray['ams'] * 4 + tray['tray']}")
+    return ("print", {"command": "ams_get_rfid", "ams_id": tray["ams"], "slot_id": tray["tray"]})
 
 
 def find_tray(status: dict, slot) -> dict | None:

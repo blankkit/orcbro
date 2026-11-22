@@ -130,7 +130,7 @@ working. Jobs are shared; each belongs to a printer (`printer`), uploaded throug
 | GET | `/api/status` | normalized printer status, including `connection.developer_mode`, `job.error` (`code`, `text`), `hms[].text`, `options` |
 | GET | `/api/events` | Server-Sent Events: `status` (at most 2/s), `job` |
 | POST | `/api/control` | `{"action": …, "value": …}`, see below |
-| POST | `/api/ams/tray` | assign a slot: `{"slot", "filament": "<profile name>", "color": "#RRGGBB"}` (`ams_filament_setting`) |
+| POST | `/api/ams/tray` | assign a slot: `{"slot", "filament": "<profile name>", "color": "#RRGGBB[AA]", "colors"?, "gradient"?}` (`ams_filament_setting`). Alpha `00` = clear, `80` = translucent. `colors`: two to four colors of a multicolor spool, as segments or with `gradient: true` as a gradient; printers with capability `multi_color` store them (`cols`, `ctype`), others only the first |
 | GET | `/api/ams/k-values` | printer's K value table for the installed nozzle: `{"nozzle_diameter", "values": [{"cali_idx", "filament_id", "name", "k", "n"}]}` |
 | POST | `/api/ams/k-value` | `{"slot", "cali_idx"}`: select a K value for a slot, `-1` = filament profile default; not for the slot currently in use for printing |
 | GET | `/api/ams/drying?ams_id=n` | drying suggestion (AMS 2 Pro, AMS HT): `temperature`, `hours`, `max_temperature`, `temperature_range`, `hours_range`, `cooling_temperature`, `filament_type`, `from_profiles` |
@@ -176,6 +176,7 @@ Slots are numbered globally: AMS 1 = 0–3 (A1–A4), AMS 2 = 4–7, external sp
 | `extrude` | mm (±50) | not printing, after homing, nozzle ≥ 170 °C | `M83` + `G0 E` |
 | `load` | slot | not printing, after homing | `print.ams_change_filament` |
 | `unload` | – | not printing, after homing | `print.ams_change_filament` (target 255) |
+| `read_rfid` | AMS slot | not printing, not the slot loaded in the toolhead | `print.ams_get_rfid` (`ams_id`, `slot_id`); `M620 R<tray>` on older firmware (P1 < 01.08.01, X1 < 01.09, A1 < 01.06, X1E). The AMS turns the spool for about 20 s; a spool without a chip ends up blank. The bridge fetches the status again after 25 and 60 s |
 | `skip_objects` | list of `identify_id` | printing, never all objects | `print.skip_objects` |
 | `clear_error` | – | printer shows a message (`print_error`) | `print.clean_print_error`, then `system.uiop` (close dialog, optional) |
 | `option` | `{"key", "enabled"}` | always; AMS options require an AMS | see below |

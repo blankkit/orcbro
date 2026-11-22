@@ -81,7 +81,9 @@ def merge(base: dict, update: dict) -> dict:
     """Recursively merge `update` into `base` in place and return `base`.
 
     Merge object lists by `id` (AMS units/slots), because printers send changed entries only.
-    All other lists replace the previous value."""
+    All other lists replace the previous value. A bare AMS slot (`{"id"}`, at most with `state`) means the slot was
+    emptied or holds a spool without known filament: it replaces the old entry, so the previous spool's fields do
+    not linger (the P1 series reports a removed spool this way)."""
     for key, value in update.items():
         old = base.get(key)
         if isinstance(value, dict) and isinstance(old, dict):
@@ -91,7 +93,8 @@ def merge(base: dict, update: dict) -> dict:
             merged = []
             for item in value:
                 prior = by_id.pop(str(item.get("id")), None)
-                merged.append(merge(prior, item) if prior is not None else item)
+                bare = key == "tray" and set(item) <= {"id", "state"}
+                merged.append(merge(prior, item) if prior is not None and not bare else item)
             # Preserve entries missing from a partial update, appending them in their previous order.
             merged.extend(by_id.values())
             merged.sort(key=lambda item: _sort_id(item.get("id")))
@@ -99,6 +102,23 @@ def merge(base: dict, update: dict) -> dict:
         else:
             base[key] = value
     return base
+
+
+def _hex(value: Any) -> int | None:
+    try:
+        return int(str(value), 16) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _present(tray: dict, exist_bits: int | None, slots: int) -> dict:
+    """Whether a spool physically sits in the slot (`tray_exist_bits`, bit ams * 4 + slot of 4-slot units). With
+    `present` and no `material` the AMS knows the spool but not its filament (Bambu Studio shows "?"). Unknown for
+    other units and printers without the bits."""
+    ams_id, tray_id = tray.get("ams"), tray.get("tray")
+    known = exist_bits is not None and slots == 4 and isinstance(ams_id, int) and ams_id < 128 and isinstance(tray_id, int)
+    tray["present"] = bool(exist_bits >> (ams_id * 4 + tray_id) & 1) if known else None
+    return tray
 
 
 def _is_id_list(value: Any) -> bool:
@@ -340,6 +360,8 @@ def _tray(raw: dict, ams_id: int | None, *, dual: bool = False, extruder_id: int
         "info_idx": raw.get("tray_info_idx") or None,
         "color": color(raw.get("tray_color")),
         "colors": colors,
+        # `ctype` 0 = gradient, 1 = segments, 2 = single color (Bambu Studio `DevFilaColorType`).
+        "gradient": len(colors) > 1 and _int(raw.get("ctype")) == 0,
         # -1 = unknown (no Bambu spool chip or remainder estimation disabled).
         "remain": remain if remain is not None and remain >= 0 else None,
         "nozzle_temp_min": _int(raw.get("nozzle_temp_min")),
@@ -351,6 +373,7 @@ def _tray(raw: dict, ams_id: int | None, *, dual: bool = False, extruder_id: int
         # Bambu spools: unique spool ID and filament weight of the full spool (grams), from the chip.
         "spool_uuid": spool_uuid if spool_uuid and set(spool_uuid) != {"0"} else None,
         "spool_weight": spool_weight if spool_weight and spool_weight > 0 else None,
+        "present": None,  # Set for AMS slots from `tray_exist_bits`.
     }
 
 
@@ -397,6 +420,7 @@ def normalize(raw: dict, *, connected: bool, last_message_at: float | None, prin
     dual = model_id in DUAL_NOZZLE_MODELS
     remote = remote_drying(p)
     units = []
+    exist_bits = _hex(ams_block.get("tray_exist_bits"))
     for unit in ams_block.get("ams") or []:
         ams_id = _int(unit.get("id"), 0) or 0
         type_id, extruder_id, track_switch = _ams_info(unit.get("info"))
@@ -413,7 +437,8 @@ def normalize(raw: dict, *, connected: bool, last_message_at: float | None, prin
             "humidity_percent": None if type_id in (2, 5) else _int(unit.get("humidity_raw")),
             "temperature": None if type_id in (2, 5) else _num(unit.get("temp")),
             "drying": drying(unit, type_id, remote),
-            "trays": [_tray(t, ams_id, dual=dual, extruder_id=extruder_id) for t in unit.get("tray") or []],
+            "trays": [_present(_tray(t, ams_id, dual=dual, extruder_id=extruder_id), exist_bits, len(unit.get("tray")))
+                      for t in unit.get("tray") or []],
         })
     external_items = []
     virtual = ams_block.get("vir_slot") or p.get("vir_slot") or []

@@ -19,10 +19,10 @@ else
   commit=$(GIT_AUTHOR_NAME=blankkit GIT_AUTHOR_EMAIL=102239494+blankkit@users.noreply.github.com \
     GIT_COMMITTER_NAME=blankkit GIT_COMMITTER_EMAIL=102239494+blankkit@users.noreply.github.com \
     git commit-tree "$tree" -p "$parent" -m "$message")
-  git push github "$commit:refs/heads/main"
+  git push github "${commit}:refs/heads/main"
   parent=$commit
 fi
 if [ -n "$tag" ]; then
   # Lightweight tag on the snapshot; local tags with the same name belong to the full history.
-  git push github "$parent:refs/tags/$tag"
+  git push github "${parent}:refs/tags/${tag}"
 fi

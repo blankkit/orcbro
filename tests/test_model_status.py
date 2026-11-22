@@ -52,6 +52,8 @@ class ModelResolutionTests(unittest.TestCase):
                          ("jpeg6000", False, False))
         self.assertEqual(caps["nozzles"], [{"id": 0, "name": 'Nozzle'}])
         self.assertTrue(caps["calibrations"]["motor_noise"])
+        self.assertFalse(caps["multi_color"])
+        self.assertTrue(self.models.find(model_id="C12").capabilities(raw={"fun2": "800020"})["multi_color"])
 
 
 class NewStatusTests(unittest.TestCase):

@@ -106,6 +106,8 @@ class Model:
             "part_skip": bool(fun is not None and fun >> 49 & 1),
             "hotend_rack": bool(fun is not None and fun >> 60 & 1),
             "pa_mode": bool(fun2 is not None and fun2 >> 3 & 1),
+            # The printer stores several colors per slot (`cols`/`ctype` in `ams_filament_setting`).
+            "multi_color": bool(fun2 is not None and fun2 >> 23 & 1),
         }
 
 
