@@ -1,0 +1,1 @@
+{"type": "filament", "name": "fdm_filament_petg", "from": "system", "instantiation": "false", "filament_type": ["PETG"], "nozzle_temperature": ["255"], "filament_max_volumetric_speed": ["12"], "filament_start_gcode": ["; bambu filament start"], "pressure_advance": ["0.02"], "cool_plate_temp": ["60"], "textured_plate_temp": ["70"]}

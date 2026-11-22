@@ -1,0 +1,1 @@
+{"type": "filament", "name": "CR-PETG @Creality K1C 0.4 nozzle", "inherits": "CR-PETG @base", "from": "system", "instantiation": "true", "filament_max_volumetric_speed": ["20"], "compatible_printers": ["Creality K1C 0.4 nozzle"]}

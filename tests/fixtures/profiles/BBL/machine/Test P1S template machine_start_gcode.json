@@ -1,0 +1,1 @@
+{"type": "machine", "name": "Test P1S template machine_start_gcode", "from": "system", "instantiation": "false", "machine_start_gcode": "G28 ; start"}

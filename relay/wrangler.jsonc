@@ -1,0 +1,25 @@
+{
+  // Relay for Live Activities and notifications (see README). Secrets: APNS_KEY (.p8 file contents), APNS_TEAM_ID,
+  // RELAY_SECRET.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bambu-push-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": false,
+  "routes": [{ "pattern": "push.blankk.it", "custom_domain": true }],
+  "vars": {
+    "APNS_KEY_ID": "JK2Q56X6XH",
+    "BUNDLE_ID": "it.blankk.bambro"
+  },
+  // Rate limits per device token, per bridge and per registration IP; Live Activities need only a few updates
+  // per minute.
+  "ratelimits": [
+    { "name": "DEVICE_LIMIT", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },
+    { "name": "SENDER_LIMIT", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } },
+    { "name": "REGISTER_LIMIT", "namespace_id": "1003", "simple": { "limit": 5, "period": 60 } }
+  ],
+  // Token hash → bridge ID (src/bridges.ts), seven days.
+  "kv_namespaces": [{ "binding": "TOKENS", "id": "cfce3807691e421898a5946ebf2f7ba8" }],
+  // No logs: job names and progress must not be retained.
+  "observability": { "enabled": false }
+}

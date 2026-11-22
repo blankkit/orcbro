@@ -1,0 +1,1 @@
+{"type": "filament", "name": "Generic PETG HF @BBL P1S 0.4 nozzle", "inherits": "fdm_filament_petg", "from": "system", "instantiation": "true", "filament_id": "OFhfPETG", "filament_vendor": ["Generic"], "compatible_printers": ["Bambu Lab P1S 0.4 nozzle"]}

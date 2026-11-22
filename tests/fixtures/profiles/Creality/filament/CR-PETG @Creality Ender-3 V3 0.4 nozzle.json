@@ -1,0 +1,1 @@
+{"type": "filament", "name": "CR-PETG @Creality Ender-3 V3 0.4 nozzle", "inherits": "CR-PETG @base", "from": "system", "instantiation": "true", "nozzle_temperature": ["240"], "compatible_printers": ["Creality Ender-3 V3 0.4 nozzle"]}

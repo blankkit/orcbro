@@ -1,0 +1,1 @@
+{"type": "machine", "name": "fdm_common", "from": "system", "instantiation": "false", "printer_technology": "FFF", "nozzle_diameter": ["0.4"], "machine_start_gcode": "OLD"}

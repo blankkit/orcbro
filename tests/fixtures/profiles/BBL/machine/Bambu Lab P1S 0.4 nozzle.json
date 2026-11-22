@@ -1,0 +1,2 @@
+{"type": "machine", "name": "Bambu Lab P1S 0.4 nozzle", "inherits": "fdm_common", "from": "system", "instantiation": "true", "printer_model": "Bambu Lab P1S",
+    "printer_variant": "0.4", "default_print_profile": "0.20mm Standard @BBL X1C", "include": ["Test P1S template machine_start_gcode"]}

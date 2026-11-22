@@ -1,0 +1,33 @@
+[
+ {
+  "print": {
+   "nozzle_temper": 48.6875,
+   "bed_temper": 46.21875,
+   "heatbreak_fan_speed": "0",
+   "wifi_signal": "-91dBm",
+   "command": "push_status",
+   "msg": 1,
+   "sequence_id": "2251"
+  }
+ },
+ {
+  "print": {
+   "nozzle_temper": 48.25,
+   "bed_temper": 46.15625,
+   "wifi_signal": "-92dBm",
+   "command": "push_status",
+   "msg": 1,
+   "sequence_id": "2252"
+  }
+ },
+ {
+  "print": {
+   "nozzle_temper": 48,
+   "bed_temper": 46.09375,
+   "wifi_signal": "-91dBm",
+   "command": "push_status",
+   "msg": 1,
+   "sequence_id": "2253"
+  }
+ }
+]

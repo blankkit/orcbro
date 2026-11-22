@@ -1,0 +1,1 @@
+{"type": "filament", "name": "Generic PETG @Creality K1C 0.4 nozzle", "inherits": "fdm_filament_pet", "from": "system", "instantiation": "true", "filament_vendor": ["Generic"]}

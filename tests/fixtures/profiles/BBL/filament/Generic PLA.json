@@ -1,0 +1,1 @@
+{"type": "filament", "name": "Generic PLA", "inherits": "fdm_filament_pla", "from": "system", "instantiation": "true", "filament_id": "OFDSrzZ8", "filament_vendor": ["Generic"], "compatible_printers": ["Bambu Lab P1S 0.4 nozzle"]}

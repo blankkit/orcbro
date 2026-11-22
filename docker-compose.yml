@@ -1,0 +1,18 @@
+# Orcbro – minimal setup. Start with `docker compose up -d`, then open http://<host>:8080 for the pairing QR code.
+services:
+  orcbro:
+    image: ghcr.io/blankkit/orcbro:latest
+    restart: unless-stopped
+    # Host networking lets Bambro find the bridge via Bonjour and reach printers on the LAN directly.
+    # Without it, publish ports 8080/8443 and pair by scanning the QR code or typing the address.
+    network_mode: host
+    volumes:
+      - orcbro-data:/data
+    environment:
+      TZ: Europe/Berlin
+      # Optional: a printer from the environment (otherwise add printers in the app).
+      # BAMBU_HOST: 192.168.1.50
+      # BAMBU_ACCESS_CODE: 12345678
+
+volumes:
+  orcbro-data:

@@ -1,0 +1,1 @@
+{"type": "filament", "name": "fdm_filament_pet", "from": "system", "instantiation": "false", "filament_type": ["PETG"], "filament_start_gcode": ["; creality start"], "pressure_advance": ["0.078"]}

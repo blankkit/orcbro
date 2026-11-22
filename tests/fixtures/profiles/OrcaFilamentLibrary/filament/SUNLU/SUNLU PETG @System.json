@@ -1,0 +1,1 @@
+{"type": "filament", "name": "SUNLU PETG @System", "inherits": "fdm_filament_pet", "from": "system", "instantiation": "true", "filament_id": "OF2GCW1l", "filament_vendor": ["SUNLU"], "compatible_printers": []}

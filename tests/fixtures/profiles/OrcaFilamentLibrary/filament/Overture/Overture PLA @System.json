@@ -1,0 +1,1 @@
+{"type": "filament", "name": "Overture PLA @System", "inherits": "fdm_filament_pla", "from": "system", "instantiation": "true", "filament_id": "OFovtPLA", "filament_vendor": ["Overture"], "nozzle_temperature": "215", "compatible_printers": []}
