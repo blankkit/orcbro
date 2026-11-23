@@ -1411,7 +1411,8 @@ MAX_COPIES = 50
 
 
 async def slice_job(request: web.Request) -> web.Response:
-    """Start slicing. Body: {slot | filament, quality, plate, support, infill, walls, brim, orient, plate_index}."""
+    """Start slicing. Body: {slot | filament, quality, plate, support, support_angle, support_on_plate, infill, walls,
+    brim, orient, plate_index}."""
     job = _job_or_404(request)
     if job.kind == "sliced":
         return error(409, m('The file is already sliced.'))
@@ -1447,7 +1448,8 @@ async def slice_job(request: web.Request) -> web.Response:
                 filament = catalog.filament_for_tray(tray.get("info_idx"), tray.get("material"))
             filaments = [filament]
             colors = [tray.get("color") if tray else None]
-            options = {k: body[k] for k in ("plate", "support", "infill", "walls", "brim") if k in body}
+            options = {k: body[k] for k in ("plate", "support", "support_angle", "support_on_plate", "infill", "walls",
+                                            "brim") if k in body}
             options.setdefault("plate", "textured_pei")
             # Validate options and profiles before starting so errors return 422 immediately.
             catalog.write_settings(request.app[JOBS].dir(job.id) / "work" / "check", process=body.get("quality"),

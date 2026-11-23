@@ -45,6 +45,8 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(self.catalog.processes, ["0.12mm Fine @BBL X1C", "0.20mm Standard @BBL X1C"])
         self.assertEqual(self.catalog.default_process(), "0.20mm Standard @BBL X1C")
         labels = [q["label"] for q in self.catalog.quality_choices()]
+        # Each quality carries its overhang angle for supports, the app's default.
+        self.assertTrue(all(isinstance(q["support_angle"], int) for q in self.catalog.quality_choices()))
         self.assertEqual(labels, ["0.12mm Fine", "0.20mm Standard"])
 
     def test_filament_for_tray(self):
@@ -112,6 +114,7 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(proc["curr_bed_type"], "Textured PEI Plate")
             self.assertEqual(proc["enable_support"], "1")
             self.assertEqual(proc["support_type"], "tree(auto)")
+            self.assertEqual(proc["support_remove_small_overhang"], "0")
             self.assertEqual(proc["sparse_infill_density"], "25%")
             self.assertEqual(proc["wall_loops"], "3")
             self.assertEqual(proc["brim_type"], "auto_brim")
@@ -125,7 +128,9 @@ class CatalogTests(unittest.TestCase):
 
 class OptionTests(unittest.TestCase):
     def test_rejects_bad_values(self):
-        for options in ({"plate": "glas"}, {"support": "maybe"}, {"infill": 150}, {"walls": 0}, {"infill": "viel"}):
+        for options in ({"plate": "glas"}, {"support": "maybe"}, {"infill": 150}, {"walls": 0}, {"infill": "viel"},
+                        {"support_angle": 91}, {"support_angle": -5}, {"support_angle": "45"}, {"support_angle": True},
+                        {"support_on_plate": "ja"}, {"support_on_plate": 1}):
             with self.subTest(options=options), self.assertRaises(ProfileError):
                 apply_options({}, options)
 
@@ -134,6 +139,21 @@ class OptionTests(unittest.TestCase):
         apply_options(proc, {"support": "off"})
         self.assertEqual(proc["enable_support"], "0")
         self.assertEqual(proc["support_type"], "normal(auto)")
+        self.assertNotIn("support_remove_small_overhang", proc)
+
+    def test_overhang_angle_and_build_plate_only(self):
+        proc = {"support_threshold_angle": "30", "support_on_build_plate_only": "0"}
+        apply_options(proc, {"support": "normal", "support_angle": 45, "support_on_plate": True})
+        self.assertEqual(proc["support_type"], "normal(auto)")
+        self.assertEqual(proc["support_threshold_angle"], "45")
+        self.assertEqual(proc["support_on_build_plate_only"], "1")
+        # Tree and normal support the same overhangs: OrcaSlicer would drop small ones for tree supports.
+        self.assertEqual(proc["support_remove_small_overhang"], "0")
+        apply_options(proc, {"support_on_plate": False})
+        self.assertEqual(proc["support_on_build_plate_only"], "0")
+        untouched = {"support_threshold_angle": "30"}
+        apply_options(untouched, {"support": "tree"})
+        self.assertEqual(untouched["support_threshold_angle"], "30")  # Without an angle, the profile's stays.
 
 
 if __name__ == "__main__":

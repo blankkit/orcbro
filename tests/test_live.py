@@ -37,17 +37,22 @@ class FakeAPNs:
         self.notes: list[tuple[str, str, dict]] = []
         self.gone: set[str] = set()
         self.down = False  # Network or relay failure.
+        self.environment: dict[str, str] = {}  # Token → its actual environment; others answer BadDeviceToken.
 
-    async def send_live_activity(self, token, environment, payload, priority=5):
+    def _check(self, token, environment):
         if token in self.gone:
             raise APNsError(410, "Unregistered")
+        if self.environment.get(token, environment) != environment:
+            raise APNsError(400, "BadDeviceToken")
+
+    async def send_live_activity(self, token, environment, payload, priority=5):
+        self._check(token, environment)
         if self.down:
             raise httpx.ConnectError("relay unreachable")
         self.sent.append((token, environment, payload, priority))
 
     async def send_notification(self, token, environment, item):
-        if token in self.gone:
-            raise APNsError(410, "Unregistered")
+        self._check(token, environment)
         self.notes.append((token, environment, item))
 
     def events(self, token=None):
@@ -246,6 +251,20 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
     async def test_gone_tokens_are_forgotten(self):
         self.apns.gone.add("aa" * 32)
         await self.live.process(status(state="RUNNING"), now=1000)
+        self.assertEqual(Registry(self.path).start, {})
+
+    async def test_wrong_environment_is_corrected(self):
+        # An archive installed from Xcode reports production, but its tokens belong to the sandbox.
+        self.registry.add("start", "aa" * 32, "production")
+        self.apns.environment["aa" * 32] = "development"
+        await self.live.process(status(state="RUNNING"), now=1000)
+        self.assertEqual(self.apns.sent[-1][:2], ("aa" * 32, "development"))
+        self.assertEqual(Registry(self.path).start["aa" * 32]["environment"], "development")  # Kept for next time.
+
+    async def test_bad_token_in_both_environments_is_forgotten(self):
+        self.apns.environment["aa" * 32] = "neither"
+        await self.live.process(status(state="RUNNING"), now=1000)
+        self.assertEqual(self.apns.sent, [])
         self.assertEqual(Registry(self.path).start, {})
 
 
@@ -625,6 +644,13 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("a3" * 32, self.registry.alerts)
         self.assertEqual(self.registry.remove_device("d2"), 1)
         self.assertEqual(Registry(self.registry.path).alerts, {})
+
+    async def test_notification_in_the_other_environment(self):
+        self.apns.environment["a1" * 32] = "development"  # Registered as production.
+        await self.live.process(status(state="RUNNING"), now=1000)
+        await self.live.process(status(state="FINISH", progress=100), now=1100)
+        self.assertEqual(self.templates("a1" * 32), ["finished"])
+        self.assertEqual(self.registry.alerts["a1" * 32]["environment"], "development")
 
     async def test_gone_tokens_are_forgotten(self):
         self.apns.gone.add("a2" * 32)

@@ -176,10 +176,10 @@ printer. Jobs saved by 0.x bridges, which had no printer, are assigned to the de
 | GET | `/api/sdcard/download` | stream a file (`?path=`, e.g. timelapse AVI), in chunks during the FTPS transfer, without `Content-Length`; a printer-side interruption ends the response without a closing chunk |
 | GET | `/api/camera/snapshot` | current JPEG |
 | GET | `/api/camera/stream` | MJPEG (`multipart/x-mixed-replace`), each frame includes `X-Frame-Time` (capture time, Unix) |
-| GET | `/api/profiles` | qualities, build plates, supports, filaments |
+| GET | `/api/profiles` | qualities (with their overhang angle for supports, `support_angle`), build plates, supports, filaments |
 | GET/POST | `/api/jobs` | list jobs / upload a file (multipart, field `file`) |
 | GET/DELETE | `/api/jobs/{id}` | read / delete a job |
-| POST | `/api/jobs/{id}/slice` | `{"slot", "quality", "plate", "support", "infill", "walls", "brim", "orient", "copies", "plate_index"}`; STL and similar files are oriented (`orient`) and arranged by default, `copies` 1–50 (overflow goes on further plates), `support` `off`/`tree`/`normal` (both "auto": supports only where needed) |
+| POST | `/api/jobs/{id}/slice` | `{"slot", "quality", "plate", "support", "support_angle", "support_on_plate", "infill", "walls", "brim", "orient", "copies", "plate_index"}`; STL and similar files are oriented (`orient`) and arranged by default, `copies` 1–50 (overflow goes on further plates), `support` `off`/`tree`/`normal` (both "auto": supports only where needed; both support small overhangs too, which OrcaSlicer would otherwise drop for tree supports), `support_angle` 0–90° (overhangs flatter than this get supports; default from the quality), `support_on_plate` `true` for supports that stand only on the build plate |
 | GET | `/api/jobs/{id}/preview` | slicing preview (OPV1 format, see `bridge/preview.py`), `?plate=n` for a specific plate; the first is precomputed after slicing |
 | GET | `/api/print/preview` | preview of the current print |
 | POST | `/api/jobs/{id}/print` | `{"mapping": {"<filament>": <slot>}, "plate", "timelapse", "bed_leveling", "flow_cali", "nozzle_offset_cali"?, "extrude_cali_manual_mode"?}` → 202, sends in the background; `flow_cali` only where `printer.flow_calibration` is not `false`; `nozzle_offset_cali` (`true`/`false`) on models with nozzle offset calibration (`capabilities.calibrations.nozzle_offset`), `extrude_cali_manual_mode` (0 or 1) on models with `capabilities.pa_mode` |

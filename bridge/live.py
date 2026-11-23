@@ -31,7 +31,7 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from .apns import APNsClient, APNsError
@@ -55,6 +55,7 @@ HEARTBEAT = 10 * 60        # Maximum interval between updates to keep the displa
 STALE_AFTER = 20 * 60      # The iPhone marks status stale after this interval.
 DISMISS_AFTER = 60 * 60    # Keep a finished print on the Lock Screen for this long.
 ENVIRONMENTS = ("development", "production")
+OTHER_ENVIRONMENT = {"development": "production", "production": "development"}
 
 
 def _first_sentence(text: str | None, limit: int = 90, fallback: str | None = None) -> str | None:
@@ -484,7 +485,8 @@ class LiveActivities:
             localized = {**render(payload, language), "language": language}
             for token, entry in entries:
                 try:
-                    await self.client.send_live_activity(token, entry["environment"], localized, priority)
+                    await self._deliver(entry, lambda environment: self.client.send_live_activity(
+                        token, environment, localized, priority))
                 except APNsError as exc:
                     self._rejected(token, f"Live Activity ({payload['aps']['event']})", exc)
                     if _transient(exc):
@@ -505,11 +507,30 @@ class LiveActivities:
             if language not in items:
                 items[language] = note(template, job_name, self.printer_name(), detail, self.printer_id, language)
             try:
-                await self.client.send_notification(token, entry["environment"], items[language])
+                await self._deliver(entry, lambda environment: self.client.send_notification(
+                    token, environment, items[language]))
             except APNsError as exc:
                 self._rejected(token, m('Notification ({p0})', p0=template), exc)
             except Exception as exc:  # noqa: BLE001 - omit this notification on network failure
                 log.warning(m('Notification (%s): %s'), template, exc)
+
+    async def _deliver(self, entry: dict, send: Callable[[str], Awaitable[None]]) -> None:
+        """Send in the registration's APNs environment. Apps can report the wrong one (an Xcode archive installed on
+        the iPhone is a Release build whose tokens belong to the sandbox): when APNs calls the token bad there, try
+        the other environment once and keep it if the push goes through."""
+        try:
+            await send(entry["environment"])
+        except APNsError as exc:
+            other = OTHER_ENVIRONMENT.get(entry.get("environment"))
+            if exc.reason != "BadDeviceToken" or other is None:
+                raise
+            try:
+                await send(other)
+            except APNsError:
+                raise exc from None
+            log.info(m('An iPhone reported the wrong push environment; using %s for its token.'), other)
+            entry["environment"] = other
+            self.registry.save()
 
     def _rejected(self, token: str, what: str, exc: APNsError) -> None:
         if exc.reason == "TokenBoundElsewhere":

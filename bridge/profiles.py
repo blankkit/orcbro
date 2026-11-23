@@ -41,6 +41,8 @@ BED_LABELS = {
 }
 
 SUPPORT_TYPES = {"off": None, "tree": "tree(auto)", "normal": "normal(auto)"}
+# OrcaSlicer's overhang angle for supports when a process profile sets none.
+ORCA_SUPPORT_ANGLE = 30
 
 # Port product profiles from vendor directories beside BBL. Prefer fast CoreXY printer variants
 # closest to the P1S; None selects profiles without a printer association.
@@ -226,7 +228,10 @@ class Catalog:
         for name in self.processes:
             p = self.resolve("process", name)
             label = re.sub(r"\s*@.*$", "", name)
-            out.append({"name": name, "label": label, "layer_height": _first_float(p.get("layer_height"))})
+            angle = _first_float(p.get("support_threshold_angle"))
+            out.append({"name": name, "label": label, "layer_height": _first_float(p.get("layer_height")),
+                        # The profile's overhang angle for supports; the app's default for `support_angle`.
+                        "support_angle": int(angle) if angle is not None else ORCA_SUPPORT_ANGLE})
         out.sort(key=lambda c: (c["layer_height"] or 0, c["label"]))
         return out
 
@@ -369,6 +374,20 @@ def apply_options(proc: dict, options: dict) -> None:
         proc["enable_support"] = "0" if support == "off" else "1"
         if SUPPORT_TYPES[support]:
             proc["support_type"] = SUPPORT_TYPES[support]
+            # Tree and normal support the same overhangs and differ only in shape. OrcaSlicer's default drops small
+            # overhangs for tree supports, so a model whose only overhangs are small got no supports at all.
+            proc["support_remove_small_overhang"] = "0"
+    angle = options.get("support_angle")
+    if angle is not None:
+        if isinstance(angle, bool) or not isinstance(angle, int) or not 0 <= angle <= 90:
+            raise ProfileError(m('Overhang angle must be between 0 and 90°.'))
+        # Overhangs flatter than this angle (from horizontal) get supports.
+        proc["support_threshold_angle"] = str(angle)
+    on_plate = options.get("support_on_plate")
+    if on_plate is not None:
+        if not isinstance(on_plate, bool):
+            raise ProfileError(m('“Only on the build plate” must be true or false.'))
+        proc["support_on_build_plate_only"] = "1" if on_plate else "0"
     infill = options.get("infill")
     if infill is not None:
         if not isinstance(infill, (int, float)) or not 0 <= infill <= 100:
